@@ -2,15 +2,16 @@
 
 import json
 import logging
+import re
 import threading
-from typing import Any
+from typing import Any, Literal
 
 import litellm
 from litellm import Router
 from litellm.router import RetryPolicy
 from pydantic import BaseModel
 
-from app.config import settings
+from app.config import save_config_file, settings
 
 LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
 
@@ -23,6 +24,16 @@ def _configure_litellm_logging() -> None:
 
 
 _configure_litellm_logging()
+
+# Let LiteLLM drop provider-unsupported params (reasoning_effort, non-default
+# temperature, etc.) instead of raising UnsupportedParamsError. This replaces
+# the hardcoded per-model compatibility branches this module used to carry.
+litellm.drop_params = True
+
+# Let LiteLLM auto-drop `thinking_blocks` from assistant messages when required
+# for a given turn (e.g., tool-call turns missing the blocks). Defensive; no
+# current code path sends thinking, but future-proofs the Router.
+litellm.modify_params = True
 
 # LLM timeout configuration (seconds) - base values
 LLM_TIMEOUT_HEALTH_CHECK = 30
@@ -41,6 +52,7 @@ class LLMConfig(BaseModel):
     model: str
     api_key: str
     api_base: str | None = None
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
 
 
 def _normalize_api_base(provider: str, api_base: str | None) -> str | None:
@@ -50,6 +62,11 @@ def _normalize_api_base(provider: str, api_base: str | None) -> str | None:
     includes a version segment (e.g., `/v1`). Some LiteLLM provider handlers
     append those segments internally, which can lead to duplicated paths like
     `/v1/v1/...` and cause 404s.
+
+    For the `openai` provider, LiteLLM uses the upstream OpenAI client which
+    handles `/v1` correctly — we MUST preserve whatever the user pasted so
+    that OpenAI-compatible endpoints like llama.cpp (http://localhost:8080/v1)
+    round-trip intact. See issue #751.
     """
     if not api_base:
         return None
@@ -60,6 +77,11 @@ def _normalize_api_base(provider: str, api_base: str | None) -> str | None:
 
     base = base.rstrip("/")
 
+    # OpenAI / OpenAI-compatible: preserve the URL as-is. The OpenAI client
+    # resolves paths correctly whether the base includes /v1 or not.
+    if provider == "openai":
+        return base or None
+
     # Anthropic handler appends '/v1/messages'. If base already ends with '/v1',
     # strip it to avoid '/v1/v1/messages'.
     if provider == "anthropic" and base.endswith("/v1"):
@@ -69,6 +91,19 @@ def _normalize_api_base(provider: str, api_base: str | None) -> str | None:
     # strip it to avoid '/v1/v1/models/...'.
     if provider == "gemini" and base.endswith("/v1"):
         base = base[: -len("/v1")].rstrip("/")
+
+    # OpenRouter base is https://openrouter.ai/api/v1. LiteLLM appends /v1
+    # internally, so strip it to avoid /v1/v1.
+    if provider == "openrouter" and base.endswith("/v1"):
+        base = base[: -len("/v1")].rstrip("/")
+
+    # Ollama doesn't use /v1 paths. Strip common suffixes users might paste:
+    # /v1, /api/chat, /api/generate
+    if provider == "ollama":
+        for suffix in ("/v1", "/api/chat", "/api/generate", "/api"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)].rstrip("/")
+                break
 
     return base or None
 
@@ -136,7 +171,17 @@ def _join_text_parts(parts: list[str]) -> str | None:
 
 
 def _extract_message_text(message: Any) -> str | None:
-    """Extract plain text from a LiteLLM message object across providers."""
+    """Extract plain text from a LiteLLM message object across providers.
+
+    Fallback order:
+      1. message.content (standard OpenAI-compatible path)
+      2. message.reasoning_content (DeepSeek R1, OpenAI o1/o3 via LiteLLM
+         standardized field)
+      3. message.thinking (Anthropic extended thinking)
+
+    Reasoning-only responses are treated as valid content so thinking models
+    can be used without special-casing them in every call site.
+    """
     content: Any = None
 
     if hasattr(message, "content"):
@@ -144,7 +189,28 @@ def _extract_message_text(message: Any) -> str | None:
     elif isinstance(message, dict):
         content = message.get("content")
 
-    return _join_text_parts(_extract_text_parts(content))
+    text = _join_text_parts(_extract_text_parts(content))
+    if text:
+        return text
+
+    # Fallback: reasoning_content (DeepSeek R1, OpenAI o1/o3).
+    reasoning = _safe_get(message, "reasoning_content")
+    text = _join_text_parts(_extract_text_parts(reasoning))
+    if text:
+        return text
+
+    # Fallback: thinking (Anthropic extended thinking).
+    thinking = _safe_get(message, "thinking")
+    return _join_text_parts(_extract_text_parts(thinking))
+
+
+def _safe_get(obj: Any, key: str) -> Any:
+    """Get attribute or dict key from an object."""
+    if hasattr(obj, key):
+        return getattr(obj, key)
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return None
 
 
 def _extract_choice_text(choice: Any) -> str | None:
@@ -152,42 +218,17 @@ def _extract_choice_text(choice: Any) -> str | None:
 
     Tries message.content first, then choice.text, then choice.delta. Handles both
     object attributes and dict keys.
-
-    Args:
-        choice: LiteLLM choice object or dict.
-
-    Returns:
-        Extracted text or None if no content is found.
     """
-    message: Any = None
-    if hasattr(choice, "message"):
-        message = choice.message
-    elif isinstance(choice, dict):
-        message = choice.get("message")
-
-    content = _extract_message_text(message)
+    content = _extract_message_text(_safe_get(choice, "message"))
     if content:
         return content
 
-    if hasattr(choice, "text"):
-        content = _join_text_parts(
-            _extract_text_parts(getattr(choice, "text")))
-        if content:
-            return content
-    if isinstance(choice, dict) and "text" in choice:
-        content = _join_text_parts(_extract_text_parts(choice.get("text")))
-        if content:
-            return content
-
-    if hasattr(choice, "delta"):
-        content = _join_text_parts(
-            _extract_text_parts(getattr(choice, "delta")))
-        if content:
-            return content
-    if isinstance(choice, dict) and "delta" in choice:
-        content = _join_text_parts(_extract_text_parts(choice.get("delta")))
-        if content:
-            return content
+    for field in ("text", "delta"):
+        value = _safe_get(choice, field)
+        if value is not None:
+            extracted = _join_text_parts(_extract_text_parts(value))
+            if extracted:
+                return extracted
 
     return None
 
@@ -245,16 +286,50 @@ def get_llm_config() -> LLMConfig:
     """Get current LLM configuration.
 
     Priority for api_key: top-level api_key > api_keys[provider] > env/settings
+    Priority for reasoning_effort: config.json > env/settings
+
+    Runs a one-shot migration for existing gpt-5 users: if provider is openai,
+    model contains 'gpt-5', and reasoning_effort is ABSENT from config.json
+    (not merely empty), persist reasoning_effort='minimal' to preserve the
+    behavior the removed hardcoded branch provided. Users who clear the
+    field explicitly (empty string persisted by the PUT handler) will not
+    have it restored.
     """
     stored = _load_stored_config()
     provider = stored.get("provider", settings.llm_provider)
+    model = stored.get("model", settings.llm_model)
+
+    # One-shot migration: preserve old gpt-5 reasoning_effort behavior for
+    # existing configs. Gated on ABSENT key so users can opt out by clearing
+    # the field (PUT handler persists an empty string on clear).
+    if (
+        provider == "openai"
+        and "gpt-5" in model.lower()
+        and "reasoning_effort" not in stored
+    ):
+        stored["reasoning_effort"] = "minimal"
+        try:
+            save_config_file(stored)
+            logging.info(
+                "Migrated gpt-5 config to preserve reasoning_effort=minimal "
+                "(set REASONING_EFFORT= or clear in Settings to disable)"
+            )
+        except Exception as e:
+            # Non-fatal — retry on next call.
+            logging.warning("Failed to persist gpt-5 migration: %s", e)
+
     api_key = resolve_api_key(stored, provider)
+
+    raw_re = stored.get("reasoning_effort", settings.reasoning_effort)
+    # Normalize empty string to None — user explicitly cleared.
+    reasoning_effort = raw_re if raw_re else None
 
     return LLMConfig(
         provider=provider,
-        model=stored.get("model", settings.llm_model),
+        model=model,
         api_key=api_key,
         api_base=stored.get("api_base", settings.llm_api_base),
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -271,7 +346,7 @@ def get_model_name(config: LLMConfig) -> str:
         "openrouter": "openrouter/",
         "gemini": "gemini/",
         "deepseek": "deepseek/",
-        "ollama": "ollama/",
+        "ollama": "ollama_chat/",  # ollama_chat/ routes to /api/chat (supports messages array)
     }
 
     prefix = provider_prefixes.get(config.provider, "")
@@ -285,7 +360,7 @@ def get_model_name(config: LLMConfig) -> str:
 
     # For other providers, don't add prefix if model already has a known prefix
     known_prefixes = ["openrouter/", "anthropic/",
-                      "gemini/", "deepseek/", "ollama/"]
+                      "gemini/", "deepseek/", "ollama/", "ollama_chat/"]
     if any(config.model.startswith(p) for p in known_prefixes):
         return config.model
 
@@ -370,32 +445,6 @@ def get_router(config: LLMConfig | None = None) -> tuple[Router, LLMConfig]:
     return router, config
 
 
-def _supports_temperature(provider: str, model: str) -> bool:
-    """Return whether passing `temperature` is supported for this model/provider combo.
-
-    Some models (e.g., OpenAI gpt-5 family) reject temperature values other than 1,
-    and LiteLLM may error when temperature is passed.
-    """
-    _ = provider
-    model_lower = model.lower()
-    if "gpt-5" in model_lower:
-        return False
-    return True
-
-
-def _get_reasoning_effort(provider: str, model: str) -> str | None:
-    """Return a default reasoning_effort for models that require it.
-
-    Some OpenAI gpt-5 models may return empty message.content unless a supported
-    `reasoning_effort` is explicitly set. This keeps downstream JSON parsing reliable.
-    """
-    _ = provider
-    model_lower = model.lower()
-    if "gpt-5" in model_lower:
-        return "minimal"
-    return None
-
-
 async def check_llm_health(
     config: LLMConfig | None = None,
     *,
@@ -425,41 +474,36 @@ async def check_llm_health(
         kwargs: dict[str, Any] = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 16,
+            "max_tokens": 64,
             "api_key": config.api_key,
             "api_base": _normalize_api_base(config.provider, config.api_base),
             "timeout": LLM_TIMEOUT_HEALTH_CHECK,
             "think": False,
         }
-        reasoning_effort = _get_reasoning_effort(config.provider, model_name)
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
+        if config.reasoning_effort:
+            kwargs["reasoning_effort"] = config.reasoning_effort
 
         response = await litellm.acompletion(**kwargs)
         content = _extract_choice_text(response.choices[0])
         if not content:
-            # Check if the model responded with reasoning/thinking content
-            message = response.choices[0].message
-            has_reasoning = getattr(message, "reasoning_content", None) or getattr(
-                message, "thinking", None)
-            if not has_reasoning:
-                # LLM-003: Empty response should mark health check as unhealthy
-                logging.warning(
-                    "LLM health check returned empty content",
-                    extra={"provider": config.provider, "model": config.model},
-                )
-                result: dict[str, Any] = {
-                    "healthy": False,  # Fixed: empty content means unhealthy
-                    "provider": config.provider,
-                    "model": config.model,
-                    "response_model": response.model if response else None,
-                    "error_code": "empty_content",  # Changed from warning_code
-                    "message": "LLM returned empty response",
-                }
-                if include_details:
-                    result["test_prompt"] = _to_code_block(prompt)
-                    result["model_output"] = _to_code_block(None)
-                return result
+            # LLM-003: Empty response (even after reasoning_content / thinking
+            # fallbacks in _extract_choice_text) marks health as unhealthy.
+            logging.warning(
+                "LLM health check returned empty content",
+                extra={"provider": config.provider, "model": config.model},
+            )
+            result: dict[str, Any] = {
+                "healthy": False,
+                "provider": config.provider,
+                "model": config.model,
+                "response_model": response.model if response else None,
+                "error_code": "empty_content",
+                "message": "LLM returned empty response",
+            }
+            if include_details:
+                result["test_prompt"] = _to_code_block(prompt)
+                result["model_output"] = _to_code_block(None)
+            return result
 
         result = {
             "healthy": True,
@@ -470,6 +514,24 @@ async def check_llm_health(
         if include_details:
             result["test_prompt"] = _to_code_block(prompt)
             result["model_output"] = _to_code_block(content)
+            # Surface reasoning/thinking text separately ONLY when the model
+            # also returned distinct primary content. If message.content was
+            # empty, _extract_choice_text already folded the reasoning text
+            # into `content` above — surfacing it here too would duplicate
+            # identical text in "Model output" and "Model thinking".
+            msg = response.choices[0].message
+            primary_content = _join_text_parts(
+                _extract_text_parts(_safe_get(msg, "content"))
+            )
+            reasoning_text = None
+            if primary_content:
+                reasoning_text = (
+                    _join_text_parts(_extract_text_parts(_safe_get(msg, "reasoning_content")))
+                    or _join_text_parts(_extract_text_parts(_safe_get(msg, "thinking")))
+                )
+            result["reasoning_content"] = (
+                _to_code_block(reasoning_text) if reasoning_text else None
+            )
         return result
     except Exception as e:
         # Log full exception details server-side, but do not expose them to clients
@@ -524,19 +586,22 @@ async def complete(
             "model": "primary",
             "messages": messages,
             "max_tokens": max_tokens,
+            "temperature": temperature,
             "timeout": LLM_TIMEOUT_COMPLETION,
         }
-        if _supports_temperature(config.provider, model_name):
-            kwargs["temperature"] = temperature
-        reasoning_effort = _get_reasoning_effort(config.provider, model_name)
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
+        if config.reasoning_effort:
+            kwargs["reasoning_effort"] = config.reasoning_effort
 
         response = await router.acompletion(**kwargs)
 
         content = _extract_choice_text(response.choices[0])
         if not content:
             raise ValueError("Empty response from LLM")
+        # Strip thinking tags from reasoning models (deepseek-r1, qwq, etc.)
+        if "<think>" in content:
+            content = _strip_thinking_tags(content)
+            if not content:
+                raise ValueError("Response contained only thinking content, no output")
         return content
     except Exception as e:
         # Log the actual error server-side for debugging
@@ -554,9 +619,18 @@ def _supports_json_mode(model_name: str) -> bool:
     anthropic, etc.) so that capability is always determined from the
     registry rather than a hardcoded provider list.
 
+    Ollama models support JSON mode natively (format="json") but are
+    often not in LiteLLM's registry (custom/local models), so we
+    always return True for ollama.
+
     Args:
         model_name: LiteLLM-formatted model name (from get_model_name).
     """
+    # Ollama supports JSON mode natively via format="json" even when
+    # models aren't in LiteLLM's registry (custom, quantized, etc.)
+    if model_name.startswith(("ollama/", "ollama_chat/")):
+        return True
+
     try:
         info = litellm.get_model_info(model=model_name)
         supported_params = info.get("supported_openai_params", [])
@@ -635,6 +709,20 @@ def _calculate_timeout(
     return int(base * token_factor * provider_factor)
 
 
+def _strip_thinking_tags(content: str) -> str:
+    """Strip thinking/reasoning tags from model output.
+
+    Ollama thinking models (deepseek-r1, qwq, etc.) wrap their reasoning
+    in <think>...</think> tags. The actual answer follows after the closing
+    tag. Strip these so JSON extraction finds the real output.
+    """
+    # Remove <think>...</think> blocks (including multiline)
+    stripped = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    # Also handle unclosed <think> tag (model may still be "thinking" at end)
+    stripped = re.sub(r"<think>.*", "", stripped, flags=re.DOTALL)
+    return stripped.strip()
+
+
 def _extract_json(content: str, _depth: int = 0) -> str:
     """Extract JSON from LLM response, handling various formats.
 
@@ -651,6 +739,10 @@ def _extract_json(content: str, _depth: int = 0) -> str:
             f"Content too large for JSON extraction: {len(content)} bytes")
 
     original = content
+
+    # Strip thinking model tags (deepseek-r1, qwq, etc.)
+    if "<think>" in content:
+        content = _strip_thinking_tags(content)
 
     # Remove markdown code blocks
     if "```json" in content:
@@ -744,22 +836,18 @@ async def complete_json(
     # Check if we can use JSON mode
     use_json_mode = _supports_json_mode(model_name)
 
-    last_error = None
     for attempt in range(retries + 1):
         try:
             kwargs: dict[str, Any] = {
                 "model": "primary",
                 "messages": messages,
+                # LLM-002: Increase temperature on retry for variation
+                "temperature": _get_retry_temperature(attempt),
                 "max_tokens": max_tokens,
                 "timeout": _calculate_timeout("json", max_tokens, config.provider),
             }
-            if _supports_temperature(config.provider, model_name):
-                # LLM-002: Increase temperature on retry for variation
-                kwargs["temperature"] = _get_retry_temperature(attempt)
-            reasoning_effort = _get_reasoning_effort(
-                config.provider, model_name)
-            if reasoning_effort:
-                kwargs["reasoning_effort"] = reasoning_effort
+            if config.reasoning_effort:
+                kwargs["reasoning_effort"] = config.reasoning_effort
 
             # Add JSON mode if supported
             if use_json_mode:
@@ -799,7 +887,6 @@ async def complete_json(
 
         except json.JSONDecodeError as e:
             # Content quality — malformed JSON, retry with prompt hint
-            last_error = e
             logging.warning(f"JSON parse failed (attempt {attempt + 1}): {e}")
             if attempt < retries:
                 messages[-1]["content"] = (
@@ -812,7 +899,6 @@ async def complete_json(
 
         except ValueError as e:
             # Content quality — empty response, JSON extraction failure
-            last_error = e
             logging.warning(f"Content extraction failed (attempt {attempt + 1}): {e}")
             if attempt < retries:
                 continue
@@ -824,4 +910,4 @@ async def complete_json(
             # retry is attempted here.
             raise
 
-    raise ValueError(f"Failed after {retries + 1} attempts: {last_error}")
+    raise ValueError(f"Failed after {retries + 1} attempts")

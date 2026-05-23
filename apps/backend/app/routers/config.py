@@ -31,6 +31,7 @@ from app.config import (
     delete_api_key_from_config,
     clear_all_api_keys,
 )
+from app.config_cache import invalidate_config_cache
 from app.database import db
 
 router = APIRouter(prefix="/config", tags=["Configuration"])
@@ -50,10 +51,11 @@ def _load_config() -> dict:
 
 
 def _save_config(config: dict) -> None:
-    """Save config to file."""
+    """Save config to file and invalidate the resume router's cache."""
     path = _get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2))
+    invalidate_config_cache()
 
 
 def _mask_api_key(key: str) -> str:
@@ -92,11 +94,13 @@ async def get_llm_config_endpoint() -> LLMConfigResponse:
     stored = _load_config()
 
     provider = stored.get("provider", settings.llm_provider)
+    reasoning_effort = stored.get("reasoning_effort", settings.reasoning_effort)
     return LLMConfigResponse(
         provider=provider,
         model=stored.get("model", settings.llm_model),
         api_key=_mask_api_key(resolve_api_key(stored, provider)),
         api_base=stored.get("api_base", settings.llm_api_base),
+        reasoning_effort=reasoning_effort or None,
     )
 
 
@@ -125,14 +129,21 @@ async def update_llm_config(
         stored["api_key"] = request.api_key
     if request.api_base is not None:
         stored["api_base"] = request.api_base
+    if request.reasoning_effort is not None:
+        # Persist empty string on clear so the gpt-5 auto-migration doesn't
+        # re-fire on next get_llm_config() call.
+        stored["reasoning_effort"] = request.reasoning_effort
 
     # Build normalized config for response and background health check
     resolved_provider = stored.get("provider", settings.llm_provider)
+    raw_re = stored.get("reasoning_effort", settings.reasoning_effort)
+    resolved_reasoning_effort = raw_re if raw_re else None
     test_config = LLMConfig(
         provider=resolved_provider,
         model=stored.get("model", settings.llm_model),
         api_key=resolve_api_key(stored, resolved_provider),
         api_base=stored.get("api_base", settings.llm_api_base),
+        reasoning_effort=resolved_reasoning_effort,
     )
 
     # Save config regardless of health check outcome (see docstring).
@@ -146,6 +157,7 @@ async def update_llm_config(
         model=test_config.model,
         api_key=_mask_api_key(test_config.api_key),
         api_base=test_config.api_base,
+        reasoning_effort=test_config.reasoning_effort,
     )
 
 
@@ -180,6 +192,11 @@ async def test_llm_connection(request: LLMConfigRequest | None = None) -> dict:
             request.api_base
             if request and request.api_base is not None
             else stored.get("api_base", settings.llm_api_base)
+        ),
+        reasoning_effort=(
+            (request.reasoning_effort or None)
+            if request and request.reasoning_effort is not None
+            else (stored.get("reasoning_effort") or settings.reasoning_effort) or None
         ),
     )
 
@@ -406,6 +423,7 @@ async def update_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateRespons
         updated.append("deepseek")
 
     save_api_keys_to_config(stored_keys)
+    invalidate_config_cache()
 
     return ApiKeysUpdateResponse(
         message=f"Updated {len(updated)} API key(s)",
@@ -435,6 +453,7 @@ async def delete_all_api_keys(confirm: str | None = None) -> dict:
             detail="Confirmation required. Pass confirm=CLEAR_ALL_KEYS query parameter.",
         )
     clear_all_api_keys()
+    invalidate_config_cache()
     return {"message": "All API keys have been cleared"}
 
 
@@ -455,6 +474,7 @@ async def delete_api_key(provider: str) -> dict:
         )
 
     delete_api_key_from_config(provider)
+    invalidate_config_cache()
 
     return {"message": f"API key for {provider} has been removed"}
 

@@ -551,6 +551,9 @@ class ImproveResumeConfirmRequest(BaseModel):
 
 
 # Config Models
+ReasoningEffortLiteral = Literal["minimal", "low", "medium", "high"]
+
+
 class LLMConfigRequest(BaseModel):
     """Request to update LLM configuration."""
 
@@ -558,6 +561,14 @@ class LLMConfigRequest(BaseModel):
     model: str | None = None
     api_key: str | None = None
     api_base: str | None = None
+    # Optional reasoning-effort override.
+    #   - A valid value ("minimal"/"low"/"medium"/"high") updates the setting.
+    #   - Empty string clears the field — the server persists "" rather than
+    #     removing the key, so the gpt-5 auto-migration does not re-fire.
+    #   - None means "don't change this field".
+    # Strictly typed so invalid values are rejected at the boundary (422)
+    # rather than corrupting config.json and crashing later reads.
+    reasoning_effort: Literal["minimal", "low", "medium", "high", ""] | None = None
 
 
 class LLMConfigResponse(BaseModel):
@@ -567,6 +578,7 @@ class LLMConfigResponse(BaseModel):
     model: str
     api_key: str  # Masked
     api_base: str | None = None
+    reasoning_effort: ReasoningEffortLiteral | None = None
 
 
 class FeatureConfigRequest(BaseModel):
@@ -688,7 +700,6 @@ class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str
-    llm: dict[str, Any]
 
 
 class StatusResponse(BaseModel):
@@ -699,3 +710,27 @@ class StatusResponse(BaseModel):
     llm_healthy: bool
     has_master_resume: bool
     database_stats: dict[str, Any]
+
+
+# Diff-Based Improvement Models
+
+
+class ResumeChange(BaseModel):
+    """A single targeted change the LLM wants to make to the resume."""
+
+    path: str = Field(
+        description="Dot+bracket path, e.g. 'workExperience[0].description[1]'"
+    )
+    action: Literal["replace", "append", "reorder"]
+    original: str | None = Field(
+        default=None, description="Current text at path — for verification"
+    )
+    value: str | list[str] = Field(description="New content")
+    reason: str = Field(description="Why this change helps match the JD")
+
+
+class ImproveDiffResult(BaseModel):
+    """LLM output: a list of targeted resume changes."""
+
+    changes: list[ResumeChange] = Field(default_factory=list)
+    strategy_notes: str = Field(default="")

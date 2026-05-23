@@ -14,10 +14,11 @@ import {
   clearAllApiKeys,
   resetDatabase,
   PROVIDER_INFO,
-  type LLMConfig,
+  type LLMConfigUpdate,
   type LLMProvider,
   type LLMHealthCheck,
   type PromptOption,
+  type ReasoningEffort,
 } from '@/lib/api/config';
 import { API_URL } from '@/lib/api/client';
 import { getVersionString } from '@/lib/config/version';
@@ -65,9 +66,9 @@ const PROVIDERS: LLMProvider[] = [
 ];
 
 const SEGMENTED_BUTTON_BASE =
-  'border border-black font-mono transition-all duration-150 ease-out shadow-[2px_2px_0px_0px_#000000] hover:translate-y-[1px] hover:translate-x-[1px] hover:shadow-none disabled:cursor-not-allowed disabled:opacity-50';
+  'border border-black font-mono transition-all duration-150 ease-out shadow-sw-sm hover:translate-y-[1px] hover:translate-x-[1px] hover:shadow-none disabled:cursor-not-allowed disabled:opacity-50';
 const SEGMENTED_BUTTON_ACTIVE = 'bg-blue-700 text-white border-black hover:bg-blue-800';
-const SEGMENTED_BUTTON_INACTIVE = 'bg-white text-black hover:bg-[#E5E5E0]';
+const SEGMENTED_BUTTON_INACTIVE = 'bg-white text-black hover:bg-secondary';
 
 const unwrapCodeBlock = (value?: string | null): string | null => {
   if (!value) return null;
@@ -104,6 +105,11 @@ export default function SettingsPage() {
   const [apiKey, setApiKey] = useState('');
   const [apiBase, setApiBase] = useState('');
   const [hasStoredApiKey, setHasStoredApiKey] = useState(false);
+  // 'auto' is the UI sentinel for "do not send reasoning_effort". Maps to
+  // empty string when persisted to the backend (so gpt-5 auto-migration
+  // won't re-fire on next load). Typed tightly so invalid values can't leak
+  // through the save path.
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | 'auto'>('auto');
 
   // Use cached system status (loaded on app start, refreshes every 30 min)
   const {
@@ -204,6 +210,11 @@ export default function SettingsPage() {
         value: unwrapCodeBlock(healthCheck.model_output),
       },
       {
+        key: 'reasoningContent',
+        label: t('settings.llmConfiguration.reasoningContentLabel'),
+        value: unwrapCodeBlock(healthCheck.reasoning_content),
+      },
+      {
         key: 'errorDetail',
         label: t('settings.llmConfiguration.errorDetailLabel'),
         value: unwrapCodeBlock(healthCheck.error_detail),
@@ -254,6 +265,7 @@ export default function SettingsPage() {
           setHasStoredApiKey(Boolean(llmConfig.api_key));
           setApiKey(isMaskedKey ? '' : llmConfig.api_key || '');
           setApiBase(llmConfig.api_base || '');
+          setReasoningEffort((llmConfig.reasoning_effort as ReasoningEffort | null) ?? 'auto');
 
           if (providerFromBackend !== safeProvider) {
             setError(t('settings.errors.unknownProvider', { provider: providerFromBackend }));
@@ -314,22 +326,25 @@ export default function SettingsPage() {
       }
 
       const trimmedKey = apiKey.trim();
-      const config: Partial<LLMConfig> = {
+      const update: LLMConfigUpdate = {
         provider,
         model: model.trim(),
         api_base: apiBase.trim() || null,
+        // Map UI sentinel 'auto' → '' so the server persists an empty string
+        // and the gpt-5 auto-migration won't re-fire.
+        reasoning_effort: reasoningEffort === 'auto' ? '' : (reasoningEffort as ReasoningEffort),
       };
       if (requiresApiKey) {
         if (trimmedKey) {
-          config.api_key = trimmedKey;
+          update.api_key = trimmedKey;
         } else if (!hasStoredApiKey) {
-          config.api_key = '';
+          update.api_key = '';
         }
       } else {
-        config.api_key = '';
+        update.api_key = '';
       }
 
-      await updateLlmConfig(config);
+      await updateLlmConfig(update);
 
       // Refresh cached system status after save
       await refreshStatus();
@@ -351,10 +366,11 @@ export default function SettingsPage() {
 
     try {
       // Build config from current form values
-      const testConfig: Partial<LLMConfig> = {
+      const testConfig: LLMConfigUpdate = {
         provider,
         model: model.trim() || providerInfo.defaultModel,
         api_base: apiBase.trim() || null,
+        reasoning_effort: reasoningEffort === 'auto' ? '' : (reasoningEffort as ReasoningEffort),
       };
 
       // Only include API key if provided or if we have a stored key
@@ -430,6 +446,7 @@ export default function SettingsPage() {
         setHasStoredApiKey(Boolean(llmConfig.api_key));
         setApiKey(isMaskedKey ? '' : llmConfig.api_key || '');
         setApiBase(llmConfig.api_base || '');
+        setReasoningEffort(llmConfig.reasoning_effort ?? 'auto');
       } else {
         // Fallback if refetch fails
         setApiKey('');
@@ -500,22 +517,15 @@ export default function SettingsPage() {
   const requiresApiKey = providerInfo.requiresKey ?? true;
 
   return (
-    <div
-      className="flex flex-col items-center justify-start p-6 md:p-12 min-h-screen overflow-y-auto"
-      style={{
-        backgroundImage:
-          'linear-gradient(rgba(29, 78, 216, 0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(29, 78, 216, 0.05) 1px, transparent 1px)',
-        backgroundSize: '40px 40px',
-      }}
-    >
-      <div className="w-full max-w-4xl border border-black bg-[#F0F0E8] shadow-[8px_8px_0px_0px_rgba(0,0,0,0.1)]">
+    <div className="flex flex-col items-center justify-start p-6 md:p-12 min-h-screen overflow-y-auto">
+      <div className="w-full max-w-4xl border border-black bg-background shadow-sw-lg">
         {/* Header */}
         <div className="border-b border-black p-8 bg-white flex justify-between items-start">
           <div>
             <h1 className="font-serif text-3xl font-bold tracking-tight uppercase">
               {t('settings.title')}
             </h1>
-            <p className="font-mono text-xs text-gray-500 mt-2 uppercase tracking-wider">
+            <p className="font-mono text-xs text-steel-grey mt-2 uppercase tracking-wider">
               {'// '}
               {t('settings.subtitle')}
             </p>
@@ -531,7 +541,7 @@ export default function SettingsPage() {
         <div className="p-8 space-y-10">
           {/* API Key Not Configured Warning */}
           {!statusLoading && systemStatus && !systemStatus.llm_configured && (
-            <div className="border-2 border-amber-500 bg-amber-50 p-4 shadow-[4px_4px_0px_0px_rgba(0,0,0,0.1)]">
+            <div className="border-2 border-amber-500 bg-amber-50 p-4 shadow-sw-default">
               <div className="flex items-start gap-3">
                 <div className="w-3 h-3 bg-amber-500 mt-1 shrink-0"></div>
                 <div className="flex-1">
@@ -557,7 +567,7 @@ export default function SettingsPage() {
                   </h2>
                 </div>
                 {lastFetched && (
-                  <span className="font-mono text-xs text-gray-400 flex items-center gap-1">
+                  <span className="font-mono text-xs text-steel-grey flex items-center gap-1">
                     <Clock className="w-3 h-3" />
                     {formatLastFetched()}
                   </span>
@@ -577,14 +587,14 @@ export default function SettingsPage() {
 
             {statusLoading ? (
               <div className="flex items-center justify-center p-8">
-                <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+                <Loader2 className="w-6 h-6 animate-spin text-steel-grey" />
               </div>
             ) : !systemStatus ? (
               <div className="flex flex-col items-center justify-center p-8 gap-3 border border-dashed border-red-300 bg-red-50">
                 <p className="font-mono text-xs text-red-600 uppercase">
                   {t('settings.systemStatus.unableToConnect')}
                 </p>
-                <p className="font-mono text-xs text-gray-600">
+                <p className="font-mono text-xs text-ink-soft">
                   {t('settings.systemStatus.expectedAt', { apiUrl: API_URL })}
                 </p>
                 <Button
@@ -598,69 +608,74 @@ export default function SettingsPage() {
                 </Button>
               </div>
             ) : (
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                {/* LLM Status */}
-                <div className="border border-black bg-white p-4 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)]">
-                  <div className="flex items-center gap-2 mb-2">
-                    <Server className="w-4 h-4 text-gray-500" />
-                    <span className="font-mono text-xs uppercase text-gray-500">
-                      {t('settings.statusCards.llm')}
-                    </span>
+              // @container so the status cards adapt to the section width
+              // rather than the viewport — useful when the settings page is
+              // shown alongside a sidebar or in a split view.
+              <div className="@container">
+                <div className="grid grid-cols-2 @3xl:grid-cols-4 gap-4">
+                  {/* LLM Status */}
+                  <div className="border border-black bg-white p-4 shadow-sw-sm">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Server className="w-4 h-4 text-steel-grey" />
+                      <span className="font-mono text-xs uppercase text-steel-grey">
+                        {t('settings.statusCards.llm')}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {systemStatus.llm_healthy ? (
+                        <CheckCircle2 className="w-5 h-5 text-green-600" />
+                      ) : (
+                        <XCircle className="w-5 h-5 text-red-500" />
+                      )}
+                      <span className="font-mono text-sm font-bold">
+                        {systemStatus.llm_healthy
+                          ? t('settings.statusValues.healthy')
+                          : t('settings.statusValues.offline')}
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    {systemStatus.llm_healthy ? (
+
+                  {/* Database Status */}
+                  <div className="border border-black bg-white p-4 shadow-sw-sm">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Database className="w-4 h-4 text-steel-grey" />
+                      <span className="font-mono text-xs uppercase text-steel-grey">
+                        {t('settings.statusCards.database')}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
                       <CheckCircle2 className="w-5 h-5 text-green-600" />
-                    ) : (
-                      <XCircle className="w-5 h-5 text-red-500" />
-                    )}
-                    <span className="font-mono text-sm font-bold">
-                      {systemStatus.llm_healthy
-                        ? t('settings.statusValues.healthy')
-                        : t('settings.statusValues.offline')}
-                    </span>
+                      <span className="font-mono text-sm font-bold">
+                        {t('settings.statusValues.connected')}
+                      </span>
+                    </div>
                   </div>
-                </div>
 
-                {/* Database Status */}
-                <div className="border border-black bg-white p-4 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)]">
-                  <div className="flex items-center gap-2 mb-2">
-                    <Database className="w-4 h-4 text-gray-500" />
-                    <span className="font-mono text-xs uppercase text-gray-500">
-                      {t('settings.statusCards.database')}
+                  {/* Resumes Count */}
+                  <div className="border border-black bg-white p-4 shadow-sw-sm">
+                    <div className="flex items-center gap-2 mb-2">
+                      <FileText className="w-4 h-4 text-steel-grey" />
+                      <span className="font-mono text-xs uppercase text-steel-grey">
+                        {t('settings.statusCards.resumes')}
+                      </span>
+                    </div>
+                    <span className="font-mono text-2xl font-bold">
+                      {systemStatus.database_stats.total_resumes}
                     </span>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <CheckCircle2 className="w-5 h-5 text-green-600" />
-                    <span className="font-mono text-sm font-bold">
-                      {t('settings.statusValues.connected')}
-                    </span>
-                  </div>
-                </div>
 
-                {/* Resumes Count */}
-                <div className="border border-black bg-white p-4 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)]">
-                  <div className="flex items-center gap-2 mb-2">
-                    <FileText className="w-4 h-4 text-gray-500" />
-                    <span className="font-mono text-xs uppercase text-gray-500">
-                      {t('settings.statusCards.resumes')}
+                  {/* Jobs Count */}
+                  <div className="border border-black bg-white p-4 shadow-sw-sm">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Briefcase className="w-4 h-4 text-steel-grey" />
+                      <span className="font-mono text-xs uppercase text-steel-grey">
+                        {t('settings.statusCards.jobs')}
+                      </span>
+                    </div>
+                    <span className="font-mono text-2xl font-bold">
+                      {systemStatus.database_stats.total_jobs}
                     </span>
                   </div>
-                  <span className="font-mono text-2xl font-bold">
-                    {systemStatus.database_stats.total_resumes}
-                  </span>
-                </div>
-
-                {/* Jobs Count */}
-                <div className="border border-black bg-white p-4 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)]">
-                  <div className="flex items-center gap-2 mb-2">
-                    <Briefcase className="w-4 h-4 text-gray-500" />
-                    <span className="font-mono text-xs uppercase text-gray-500">
-                      {t('settings.statusCards.jobs')}
-                    </span>
-                  </div>
-                  <span className="font-mono text-2xl font-bold">
-                    {systemStatus.database_stats.total_jobs}
-                  </span>
                 </div>
               </div>
             )}
@@ -668,10 +683,10 @@ export default function SettingsPage() {
             {/* Additional Stats Row */}
             {systemStatus && (
               <div className="grid grid-cols-2 gap-4">
-                <div className="border border-black bg-white p-4 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)]">
+                <div className="border border-black bg-white p-4 shadow-sw-sm">
                   <div className="flex items-center gap-2 mb-2">
-                    <Sparkles className="w-4 h-4 text-gray-500" />
-                    <span className="font-mono text-xs uppercase text-gray-500">
+                    <Sparkles className="w-4 h-4 text-steel-grey" />
+                    <span className="font-mono text-xs uppercase text-steel-grey">
                       {t('settings.statusCards.improvements')}
                     </span>
                   </div>
@@ -679,10 +694,10 @@ export default function SettingsPage() {
                     {systemStatus.database_stats.total_improvements}
                   </span>
                 </div>
-                <div className="border border-black bg-white p-4 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)]">
+                <div className="border border-black bg-white p-4 shadow-sw-sm">
                   <div className="flex items-center gap-2 mb-2">
-                    <FileText className="w-4 h-4 text-gray-500" />
-                    <span className="font-mono text-xs uppercase text-gray-500">
+                    <FileText className="w-4 h-4 text-steel-grey" />
+                    <span className="font-mono text-xs uppercase text-steel-grey">
                       {t('settings.statusCards.masterResume')}
                     </span>
                   </div>
@@ -734,7 +749,7 @@ export default function SettingsPage() {
                     </button>
                   ))}
                 </div>
-                <p className="text-xs text-gray-500 font-mono">
+                <p className="text-xs text-steel-grey font-mono">
                   {t('settings.llmConfiguration.selectedProvider', {
                     provider: providerInfo.name,
                   })}
@@ -751,7 +766,7 @@ export default function SettingsPage() {
                   placeholder={providerInfo.defaultModel}
                   className="font-mono"
                 />
-                <p className="text-xs text-gray-500 font-mono">
+                <p className="text-xs text-steel-grey font-mono">
                   {t('settings.llmConfiguration.defaultModel', {
                     model: providerInfo.defaultModel,
                   })}
@@ -763,7 +778,7 @@ export default function SettingsPage() {
                 <Label htmlFor="apiKey">
                   {t('settings.llmConfiguration.apiKeyLabel')}{' '}
                   {!requiresApiKey && (
-                    <span className="text-gray-400">
+                    <span className="text-steel-grey">
                       {t('settings.llmConfiguration.apiKeyOptionalForOllama')}
                     </span>
                   )}
@@ -782,7 +797,7 @@ export default function SettingsPage() {
                   disabled={!requiresApiKey}
                 />
                 {requiresApiKey && hasStoredApiKey && !apiKey && (
-                  <p className="text-xs text-gray-500 font-mono">
+                  <p className="text-xs text-steel-grey font-mono">
                     {t('settings.llmConfiguration.leaveBlankToKeepExistingKey')}
                   </p>
                 )}
@@ -798,8 +813,31 @@ export default function SettingsPage() {
                   placeholder={t('settings.llmConfiguration.baseUrlPlaceholder')}
                   className="font-mono"
                 />
-                <p className="text-xs text-gray-500 font-mono">
+                <p className="text-xs text-steel-grey font-mono">
                   {t('settings.llmConfiguration.baseUrlDescription')}
+                </p>
+              </div>
+
+              {/* Reasoning Effort (optional, only applies to reasoning-capable models) */}
+              <div className="space-y-2">
+                <Dropdown
+                  label={t('settings.llmConfiguration.reasoningEffortLabel')}
+                  value={reasoningEffort}
+                  onChange={(value) => setReasoningEffort(value as ReasoningEffort | 'auto')}
+                  options={[
+                    {
+                      id: 'auto',
+                      label: t('settings.llmConfiguration.reasoningEffortAuto'),
+                      description: t('settings.llmConfiguration.reasoningEffortAutoDesc'),
+                    },
+                    { id: 'minimal', label: t('settings.llmConfiguration.reasoningEffortMinimal') },
+                    { id: 'low', label: t('settings.llmConfiguration.reasoningEffortLow') },
+                    { id: 'medium', label: t('settings.llmConfiguration.reasoningEffortMedium') },
+                    { id: 'high', label: t('settings.llmConfiguration.reasoningEffortHigh') },
+                  ]}
+                />
+                <p className="text-xs text-steel-grey font-mono">
+                  {t('settings.llmConfiguration.reasoningEffortDescription')}
                 </p>
               </div>
 
@@ -870,7 +908,7 @@ export default function SettingsPage() {
                         : t('settings.llmConfiguration.connectionFailed')}
                     </span>
                   </div>
-                  <p className="font-mono text-xs text-gray-600">
+                  <p className="font-mono text-xs text-ink-soft">
                     {t('settings.llmConfiguration.connectionDetails', {
                       provider: healthCheck.provider,
                       model: healthCheck.model,
@@ -884,16 +922,27 @@ export default function SettingsPage() {
                   )}
                   {healthDetailItems.length > 0 && (
                     <div className="mt-3 space-y-3">
-                      {healthDetailItems.map((item) => (
-                        <div key={item.key}>
-                          <p className="font-mono text-[10px] uppercase tracking-wider text-gray-600">
-                            {item.label}
-                          </p>
-                          <pre className="mt-1 whitespace-pre-wrap rounded-none border border-black bg-white p-3 text-xs text-gray-800 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)]">
-                            {item.value}
-                          </pre>
-                        </div>
-                      ))}
+                      {healthDetailItems.map((item) =>
+                        item.key === 'reasoningContent' ? (
+                          <details key={item.key} className="group">
+                            <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wider text-ink-soft hover:text-black">
+                              {item.label}
+                            </summary>
+                            <pre className="mt-1 whitespace-pre-wrap rounded-none border border-black bg-white p-3 text-xs text-ink-soft shadow-sw-sm">
+                              {item.value}
+                            </pre>
+                          </details>
+                        ) : (
+                          <div key={item.key}>
+                            <p className="font-mono text-[10px] uppercase tracking-wider text-ink-soft">
+                              {item.label}
+                            </p>
+                            <pre className="mt-1 whitespace-pre-wrap rounded-none border border-black bg-white p-3 text-xs text-ink-soft shadow-sw-sm">
+                              {item.value}
+                            </pre>
+                          </div>
+                        )
+                      )}
                     </div>
                   )}
                 </div>
@@ -911,7 +960,7 @@ export default function SettingsPage() {
             </div>
 
             <div className="space-y-2">
-              <p className="text-sm text-gray-600 mb-4">
+              <p className="text-sm text-ink-soft mb-4">
                 {t('settings.contentGeneration.description')}
               </p>
 
@@ -938,7 +987,7 @@ export default function SettingsPage() {
                 />
               </div>
 
-              <div className="pt-4 border-t border-gray-200">
+              <div className="pt-4 border-t border-paper-tint">
                 <Dropdown
                   options={localizedPromptOptions}
                   value={defaultPromptId}
@@ -963,10 +1012,10 @@ export default function SettingsPage() {
             {/* UI Language */}
             <div className="space-y-4">
               <div>
-                <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-gray-700 mb-2">
+                <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-ink-soft mb-2">
                   {t('settings.uiLanguage')}
                 </h3>
-                <p className="text-sm text-gray-600 mb-3">{t('settings.uiLanguageDescription')}</p>
+                <p className="text-sm text-ink-soft mb-3">{t('settings.uiLanguageDescription')}</p>
               </div>
 
               <div className="space-y-2">
@@ -986,12 +1035,12 @@ export default function SettingsPage() {
             </div>
 
             {/* Content Language */}
-            <div className="space-y-4 pt-4 border-t border-gray-200">
+            <div className="space-y-4 pt-4 border-t border-paper-tint">
               <div>
-                <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-gray-700 mb-2">
+                <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-ink-soft mb-2">
                   {t('settings.contentLanguage')}
                 </h3>
-                <p className="text-sm text-gray-600 mb-3">
+                <p className="text-sm text-ink-soft mb-3">
                   {t('settings.contentLanguageDescription')}
                 </p>
               </div>
@@ -1065,7 +1114,7 @@ export default function SettingsPage() {
         </div>
 
         {/* Footer */}
-        <div className="bg-[#E5E5E0] p-4 border-t border-black flex justify-between items-center">
+        <div className="bg-secondary p-4 border-t border-black flex justify-between items-center">
           <div className="flex items-center gap-2">
             <Image
               src="/logo.svg"
@@ -1074,15 +1123,15 @@ export default function SettingsPage() {
               height={20}
               className="w-5 h-5"
             />
-            <span className="font-mono text-xs text-gray-500">
+            <span className="font-mono text-xs text-steel-grey">
               {getVersionString().toUpperCase()}
             </span>
           </div>
           <div className="flex items-center gap-2">
             {statusLoading ? (
               <>
-                <Loader2 className="w-3 h-3 animate-spin text-gray-500" />
-                <span className="font-mono text-xs text-gray-500">
+                <Loader2 className="w-3 h-3 animate-spin text-steel-grey" />
+                <span className="font-mono text-xs text-steel-grey">
                   {t('settings.footer.status.checking')}
                 </span>
               </>
@@ -1100,7 +1149,7 @@ export default function SettingsPage() {
                 </span>
               </>
             ) : (
-              <span className="font-mono text-xs text-gray-500">
+              <span className="font-mono text-xs text-steel-grey">
                 {t('settings.footer.status.offline')}
               </span>
             )}

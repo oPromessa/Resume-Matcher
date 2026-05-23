@@ -70,7 +70,7 @@ cd Resume-Matcher
 cd apps/backend
 cp .env.example .env        # テンプレートから設定を作成
 uv sync                      # Python 依存関係をインストール
-uv run uvicorn app.main:app --reload --port 8000
+uv run app
 
 # 3. フロントエンド起動（ターミナル 2）
 cd apps/frontend
@@ -149,7 +149,7 @@ uv sync
 #### バックエンドサーバを起動
 
 ```bash
-uv run uvicorn app.main:app --reload --port 8000
+RELOAD=true uv run app
 ```
 
 次のような出力が表示されます：
@@ -324,7 +324,7 @@ docker-compose down
 cd apps/backend
 
 # 開発サーバ（自動リロード）
-uv run uvicorn app.main:app --reload --port 8000
+RELOAD=true uv run app
 
 # 本番サーバ
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -494,7 +494,7 @@ Resume-Matcher/
 |-------------|------|
 | [backend-guide.md](docs/agent/architecture/backend-guide.md) | バックエンドのアーキテクチャと API 詳細 |
 | [frontend-workflow.md](docs/agent/architecture/frontend-workflow.md) | ユーザーフローとコンポーネント構成 |
-| [style-guide.md](docs/agent/design/style-guide.md) | UI デザインシステム（Swiss International Style） |
+| [swiss-design-system/](docs/portable/swiss-design-system/README.md) | UI デザインシステム（Swiss International Style）— ポータブルパック |
 
 ---
 
