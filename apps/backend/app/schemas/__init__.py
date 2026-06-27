@@ -12,6 +12,8 @@ from app.schemas.models import (
     Experience,
     FeatureConfigRequest,
     FeatureConfigResponse,
+    FeaturePromptsRequest,
+    FeaturePromptsResponse,
     GenerateContentResponse,
     HealthResponse,
     ImproveDiffResult,
@@ -50,6 +52,18 @@ from app.schemas.models import (
     UpdateCoverLetterRequest,
     UpdateOutreachMessageRequest,
     UpdateTitleRequest,
+)
+from app.schemas.applications import (
+    ApplicationActionResponse,
+    ApplicationDetailResponse,
+    ApplicationListResponse,
+    ApplicationResponse,
+    ApplicationStatus,
+    ApplicationUpdate,
+    APPLICATION_STATUS_ORDER,
+    BulkDelete,
+    BulkStatusUpdate,
+    ManualApplicationCreate,
 )
 
 __all__ = [
@@ -91,6 +105,8 @@ __all__ = [
     "PromptConfigResponse",
     "FeatureConfigRequest",
     "FeatureConfigResponse",
+    "FeaturePromptsRequest",
+    "FeaturePromptsResponse",
     "ApiKeyProviderStatus",
     "ApiKeyStatusResponse",
     "ApiKeysUpdateRequest",
@@ -102,4 +118,14 @@ __all__ = [
     "GenerateContentResponse",
     "HealthResponse",
     "StatusResponse",
+    "ApplicationStatus",
+    "APPLICATION_STATUS_ORDER",
+    "ApplicationResponse",
+    "ApplicationDetailResponse",
+    "ApplicationListResponse",
+    "ManualApplicationCreate",
+    "ApplicationUpdate",
+    "BulkStatusUpdate",
+    "BulkDelete",
+    "ApplicationActionResponse",
 ]

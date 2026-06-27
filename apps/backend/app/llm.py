@@ -11,7 +11,7 @@ from litellm import Router
 from litellm.router import RetryPolicy
 from pydantic import BaseModel
 
-from app.config import save_config_file, settings
+from app.config import load_config_file, save_config_file, settings
 
 LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
 
@@ -43,6 +43,12 @@ LLM_TIMEOUT_JSON = 180  # JSON completions may take longer
 # JSON-010: JSON extraction safety limits
 MAX_JSON_EXTRACTION_RECURSION = 10
 MAX_JSON_CONTENT_SIZE = 1024 * 1024  # 1MB
+
+# Default token budget for structured JSON completions (e.g. resume parsing).
+# Chosen to accommodate large resumes while staying within most providers'
+# output limits. Callers should use get_safe_max_tokens() so this is
+# automatically clamped to the model's actual capacity.
+DEFAULT_JSON_MAX_TOKENS = 8192
 
 
 class LLMConfig(BaseModel):
@@ -79,7 +85,7 @@ def _normalize_api_base(provider: str, api_base: str | None) -> str | None:
 
     # OpenAI / OpenAI-compatible: preserve the URL as-is. The OpenAI client
     # resolves paths correctly whether the base includes /v1 or not.
-    if provider == "openai":
+    if provider in ("openai", "openai_compatible"):
         return base or None
 
     # Anthropic handler appends '/v1/messages'. If base already ends with '/v1',
@@ -106,6 +112,23 @@ def _normalize_api_base(provider: str, api_base: str | None) -> str | None:
                 break
 
     return base or None
+
+
+# Sentinel passed to the OpenAI client when the user leaves api_key blank for
+# openai_compatible. The client validates non-empty strings but not the value
+# format; local servers that don't check auth ignore it.
+_OPENAI_COMPATIBLE_SENTINEL = "sk-no-key"
+
+
+def _effective_api_key(provider: str, api_key: str) -> str:
+    """Return the api_key to pass to LiteLLM.
+
+    For openai_compatible with a blank key, substitute a sentinel so the
+    OpenAI client accepts the call. Other providers pass through unchanged.
+    """
+    if provider == "openai_compatible" and not api_key:
+        return _OPENAI_COMPATIBLE_SENTINEL
+    return api_key
 
 
 def _extract_text_parts(value: Any, depth: int = 0, max_depth: int = 10) -> list[str]:
@@ -241,33 +264,72 @@ def _to_code_block(content: str | None, language: str = "text") -> str:
     return f"```{language}\n{text}\n```"
 
 
-def _load_stored_config() -> dict:
-    """Load config from config.json file."""
-    config_path = settings.config_path
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+# Regex for provider-style API-key tokens that may appear in upstream error
+# messages (OpenAI / Anthropic / OpenRouter / DeepSeek all use ``sk-...``;
+# Google AI Studio uses ``AIza...``). The OpenAI client already partially
+# masks keys in its error text but leaves the first ~8 and last ~4 chars
+# visible, which is enough to identify the provider and correlate with the
+# user's stored key. We redact any remaining key-like run before we surface
+# the message to the client via ``error_detail``.
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # sk-<anything-non-whitespace>, covering both plain and already-masked
+    # tokens (e.g., ``sk-ant-a****...7QAA``). Minimum length of 12 avoids
+    # matching harmless substrings like ``sk-foo``.
+    re.compile(r"sk-[A-Za-z0-9_\-*.]{12,}"),
+    # Google AI Studio.
+    re.compile(r"AIza[0-9A-Za-z_\-]{10,}"),
+    # Generic Bearer tokens in an Authorization header line.
+    re.compile(r"(?i)(Bearer\s+)[^\s\"']+"),
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Redact API-key-like substrings before the text leaves the server.
+
+    Applied to ``error_detail`` on the failing-health-check path so that
+    upstream exception messages (which may include partially-masked keys)
+    can't be used by a Settings-page viewer to identify which provider /
+    key variant is configured.
+    """
+    if not text:
+        return text
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("<redacted>", redacted)
+    return redacted
 
 
 _PROVIDER_KEY_MAP: dict[str, str] = {
     "openai": "openai",
+    "openai_compatible": "openai_compatible",
     "anthropic": "anthropic",
     "gemini": "google",
     "openrouter": "openrouter",
     "deepseek": "deepseek",
+    "groq": "groq",
     "ollama": "ollama",
 }
+
+
+# Providers where the user commonly runs a local server without auth. For
+# these, we MUST NOT fall back to ``settings.llm_api_key`` (the env-level
+# default), because the env var may hold a real paid-API key that would then
+# leak to a local/compatible endpoint the user set up expecting no auth.
+_PROVIDERS_WITHOUT_ENV_KEY_FALLBACK: frozenset[str] = frozenset(
+    {"openai_compatible", "ollama"}
+)
 
 
 def resolve_api_key(stored: dict, provider: str) -> str:
     """Resolve the effective API key from stored config.
 
-    Priority: top-level api_key > api_keys[provider] > env/settings default.
+    Priority: top-level ``api_key`` > ``api_keys[provider]`` > env/settings
+    default — EXCEPT for providers in ``_PROVIDERS_WITHOUT_ENV_KEY_FALLBACK``
+    (``openai_compatible`` / ``ollama``), where the env-level default is
+    skipped so a paid OpenAI key in ``LLM_API_KEY`` cannot leak to a local
+    self-hosted server when the user leaves the provider key blank.
 
-    This is the single source of truth for key resolution.  Every code path
+    This is the single source of truth for key resolution. Every code path
     that needs an API key (runtime, config display, health check, test
     endpoint) must call this function instead of reading ``stored["api_key"]``
     directly.
@@ -278,7 +340,12 @@ def resolve_api_key(stored: dict, provider: str) -> str:
         if not isinstance(api_keys, dict):
             api_keys = {}
         config_provider = _PROVIDER_KEY_MAP.get(provider, provider)
-        api_key = api_keys.get(config_provider, settings.llm_api_key)
+        env_default = (
+            ""
+            if provider in _PROVIDERS_WITHOUT_ENV_KEY_FALLBACK
+            else settings.llm_api_key
+        )
+        api_key = api_keys.get(config_provider, env_default)
     return api_key
 
 
@@ -295,7 +362,7 @@ def get_llm_config() -> LLMConfig:
     field explicitly (empty string persisted by the PUT handler) will not
     have it restored.
     """
-    stored = _load_stored_config()
+    stored = load_config_file()
     provider = stored.get("provider", settings.llm_provider)
     model = stored.get("model", settings.llm_model)
 
@@ -342,10 +409,15 @@ def get_model_name(config: LLMConfig) -> str:
     """
     provider_prefixes = {
         "openai": "",  # OpenAI models don't need prefix
+        # openai_compatible: route via LiteLLM's openai/ prefix so the OpenAI
+        # client handles the request; works for llama.cpp, vLLM, LM Studio,
+        # and any server exposing the OpenAI Chat Completions API shape.
+        "openai_compatible": "openai/",
         "anthropic": "anthropic/",
         "openrouter": "openrouter/",
         "gemini": "gemini/",
         "deepseek": "deepseek/",
+        "groq": "groq/",
         "ollama": "ollama_chat/",  # ollama_chat/ routes to /api/chat (supports messages array)
     }
 
@@ -359,8 +431,16 @@ def get_model_name(config: LLMConfig) -> str:
         return f"openrouter/{config.model}"
 
     # For other providers, don't add prefix if model already has a known prefix
-    known_prefixes = ["openrouter/", "anthropic/",
-                      "gemini/", "deepseek/", "ollama/", "ollama_chat/"]
+    known_prefixes = [
+        "openrouter/",
+        "anthropic/",
+        "gemini/",
+        "deepseek/",
+        "groq/",
+        "ollama/",
+        "ollama_chat/",
+        "openai/",
+    ]
     if any(config.model.startswith(p) for p in known_prefixes):
         return config.model
 
@@ -394,8 +474,9 @@ def _build_router(config: LLMConfig) -> Router:
     model_name = get_model_name(config)
 
     litellm_params: dict[str, Any] = {"model": model_name}
-    if config.api_key:
-        litellm_params["api_key"] = config.api_key
+    effective_key = _effective_api_key(config.provider, config.api_key)
+    if effective_key:
+        litellm_params["api_key"] = effective_key
     api_base = _normalize_api_base(config.provider, config.api_base)
     if api_base:
         litellm_params["api_base"] = api_base
@@ -455,8 +536,11 @@ async def check_llm_health(
     if config is None:
         config = get_llm_config()
 
-    # Check if API key is configured (except for Ollama)
-    if config.provider != "ollama" and not config.api_key:
+    # Check if API key is configured. Ollama and openai_compatible local
+    # servers often run without auth, so a blank key is acceptable for those
+    # providers — a sentinel is passed downstream (see _effective_api_key)
+    # to satisfy the OpenAI client's non-empty-string validation.
+    if config.provider not in ("ollama", "openai_compatible") and not config.api_key:
         return {
             "healthy": False,
             "provider": config.provider,
@@ -475,7 +559,7 @@ async def check_llm_health(
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 64,
-            "api_key": config.api_key,
+            "api_key": _effective_api_key(config.provider, config.api_key),
             "api_base": _normalize_api_base(config.provider, config.api_base),
             "timeout": LLM_TIMEOUT_HEALTH_CHECK,
             "think": False,
@@ -558,7 +642,10 @@ async def check_llm_health(
         if include_details:
             result["test_prompt"] = _to_code_block(prompt)
             result["model_output"] = _to_code_block(None)
-            result["error_detail"] = _to_code_block(message)
+            # Scrub api-key-like tokens before surfacing the upstream error
+            # text so the Settings UI can't be used to read back even a
+            # partially-masked copy of the configured key.
+            result["error_detail"] = _to_code_block(_scrub_secrets(message))
         return result
 
 
@@ -586,9 +673,10 @@ async def complete(
             "model": "primary",
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
-            "timeout": LLM_TIMEOUT_COMPLETION,
+            "timeout": _calculate_timeout("completion", max_tokens, config.provider),
         }
+        if _supports_temperature(model_name, temperature):
+            kwargs["temperature"] = temperature
         if config.reasoning_effort:
             kwargs["reasoning_effort"] = config.reasoning_effort
 
@@ -644,38 +732,191 @@ def _supports_json_mode(model_name: str) -> bool:
         return False
 
 
-def _appears_truncated(data: dict) -> bool:
+def _is_response_format_unsupported(error: Exception) -> bool:
+    """Return True if a 400 indicates the server rejected ``response_format``.
+
+    Some OpenAI-compatible servers (e.g. LM Studio, older llama.cpp builds) are
+    reported as supporting ``response_format`` by LiteLLM's registry but reject
+    the ``{"type": "json_object"}`` we send for JSON mode, returning a 400 such
+    as ``'response_format.type' must be 'json_schema' or 'text'`` (issue #857).
+
+    Detecting this lets ``complete_json`` fall back to prompt-only JSON mode
+    instead of failing the whole request, while genuine bad requests (e.g.
+    context-length errors) still propagate.
+
+    Requires both a mention of ``response_format`` *and* a rejection/validation
+    cue, so that an unrelated 400 which merely names the parameter (e.g. a
+    context-length error) does not trigger a pointless fallback retry. The cue
+    list stays broad enough to catch varied provider wording ("must be ...",
+    "not supported", "unsupported", "not allowed", "invalid") rather than any
+    single provider's exact message.
+    """
+    msg = str(error).lower()
+    if "response_format" not in msg:
+        return False
+    rejection_cues = ("must be", "not support", "unsupported", "not allowed", "invalid")
+    return any(cue in msg for cue in rejection_cues)
+
+
+FALLBACK_MAX_TOKENS = 4096
+
+def get_safe_max_tokens(model_name: str, requested: int = DEFAULT_JSON_MAX_TOKENS) -> int:
+    """Return a token count safe for the given model, clamped to its output limit.
+
+    Queries LiteLLM's model registry for ``max_output_tokens`` and returns
+    ``min(requested, model_limit)`` so callers never send a value that exceeds
+    what the backend actually supports.
+
+    If the model is not in the registry (e.g. custom Ollama models), it falls
+    back to a safe conservative limit (FALLBACK_MAX_TOKENS).
+
+    Args:
+        model_name: LiteLLM-formatted model name (from get_model_name).
+        requested: Desired token budget; defaults to DEFAULT_JSON_MAX_TOKENS.
+
+    Returns:
+        Safe token count, clamped correctly and always >= 1.
+    """
+    safe_requested = max(1, requested)
+
+    try:
+        info = litellm.get_model_info(model=model_name)
+        model_limit = info.get("max_output_tokens") or info.get("max_tokens")
+        if model_limit and isinstance(model_limit, int) and model_limit > 0:
+            safe = min(safe_requested, model_limit)
+            if safe < safe_requested:
+                logging.debug(
+                    "max_tokens clamped %d → %d for model %s (model limit)",
+                    safe_requested,
+                    safe,
+                    model_name,
+                )
+            return safe
+    except Exception:
+        pass  # Model not in registry, drop down to fallback logic
+
+    safe = min(safe_requested, FALLBACK_MAX_TOKENS)
+    logging.debug(
+        "Model %s not in LiteLLM registry, clamping requested max_tokens %d → %d constraint",
+        model_name,
+        safe_requested,
+        safe,
+    )
+    return safe
+
+
+def _appears_truncated(data: dict, schema_type: str = "resume") -> bool:
     """LLM-001: Check if JSON data appears to be truncated.
 
     Detects suspicious patterns indicating incomplete responses.
+    The checks are schema-aware so that enrichment/diff/keyword outputs
+    are not evaluated against resume-structure heuristics.
+
+    Args:
+        data: Parsed JSON dict.
+        schema_type: Expected schema — "resume" (full resume), "enrichment"
+            (analyze output), "diff" (diff changes), or "keywords".
+            Determines which fields are checked for truncation.
     """
     if not isinstance(data, dict):
         return False
 
-    # Check for empty arrays that should typically have content
-    suspicious_empty_arrays = ["workExperience", "education", "skills"]
-    for key in suspicious_empty_arrays:
-        if key in data and data[key] == []:
-            # Log warning - these are rarely empty in real resumes
+    if schema_type == "resume":
+        # Full resume structure: check for empty required arrays
+        suspicious_empty_arrays = ["workExperience", "education", "skills"]
+        for key in suspicious_empty_arrays:
+            if key in data and data[key] == []:
+                # Log warning - these are rarely empty in real resumes
+                logging.warning(
+                    "Possible truncation detected: '%s' is empty",
+                    key,
+                )
+                return True
+        return False
+
+    if schema_type == "enrichment":
+        # Enrichment analyze returns items_to_enrich + questions.
+        # Empty arrays are valid (resume is already strong).
+        # Only flag if keys are entirely missing (LLM ignored structure).
+        if "items_to_enrich" not in data or "questions" not in data:
             logging.warning(
-                "Possible truncation detected: '%s' is empty",
-                key,
+                "Possible truncation detected: enrichment missing required keys"
             )
             return True
+        return False
 
-    # personalInfo is intentionally excluded: the improve prompts tell the LLM
-    # to skip it, and _preserve_personal_info() restores it from the original.
-    # Checking for it here caused 3 wasteful retry attempts on every request.
-
+    # For "diff", "keywords", and unknown schemas: no truncation heuristics.
+    # Diff may legitimately return empty changes; keywords may return empty
+    # lists when the job description has no actionable terms.
     return False
 
 
-def _get_retry_temperature(attempt: int, base_temp: float = 0.1) -> float:
-    """LLM-002: Get temperature for retry attempt - increases with each retry.
+def _supports_temperature(model_name: str, temperature: float | None = None) -> bool:
+    """Check if the model supports the given temperature value.
 
-    Higher temperature on retries gives the model more variation to produce
-    different (hopefully valid) output.
+    Uses LiteLLM model registry for capability detection, with
+    provider-specific fallbacks for known restrictions:
+      - Anthropic claude-opus-4.*: temperature is deprecated
+      - Moonshot kimi-k2.6: only temperature=1 allowed
+
+    Queries LiteLLM's model info for every provider so that capability is
+    always determined from the registry rather than a hardcoded list.
+
+    Args:
+        model_name: LiteLLM-formatted model name (from get_model_name).
+        temperature: The temperature value to check. If None, returns True
+            (caller isn't setting a specific value).
+
+    Returns:
+        True if the model supports the given temperature, False otherwise.
     """
+    if temperature is None:
+        return True
+
+    # Ollama models are often not in LiteLLM's registry (custom/local),
+    # but they universally support temperature.
+    if model_name.startswith(("ollama/", "ollama_chat/")):
+        return True
+
+    try:
+        info = litellm.get_model_info(model=model_name)
+        supported_params = info.get("supported_openai_params", [])
+        if "temperature" not in supported_params:
+            return False
+    except Exception:
+        # Model not in LiteLLM's registry — be conservative and skip
+        # temperature to avoid BadRequestError from unsupported params.
+        logging.debug(
+            "Model %s not in LiteLLM registry, skipping temperature", model_name
+        )
+        return False
+
+    # Provider-specific restrictions not captured by the registry.
+    # Anthropic Opus 4.x deprecated temperature entirely.
+    if "claude-opus-4" in model_name.lower():
+        return False
+
+    # Moonshot kimi-k2.6 only allows temperature=1.
+    if "kimi-k2.6" in model_name.lower() and temperature != 1.0:
+        return False
+
+    return True
+
+
+def _get_retry_temperature(model_name: str, attempt: int, base_temp: float = 0.1) -> float | None:
+    """LLM-002: Get temperature for retry attempt.
+
+    Returns None if the model does not support temperature at all.
+    Returns 1.0 for models that only support temperature=1.
+    Otherwise returns increasing temperatures for retry variation.
+    """
+    # Moonshot kimi-k2.6 only allows temperature=1.
+    if "kimi-k2.6" in model_name.lower():
+        return 1.0
+
+    if not _supports_temperature(model_name, base_temp):
+        return None
+
     temperatures = [base_temp, 0.3, 0.5, 0.7]
     return temperatures[min(attempt, len(temperatures) - 1)]
 
@@ -702,6 +943,7 @@ def _calculate_timeout(
         "openai": 1.0,
         "anthropic": 1.2,
         "openrouter": 1.5,  # More variable latency
+        "groq": 1.0,
         "ollama": 2.0,  # Local models can be slower
     }
     provider_factor = provider_factors.get(provider, 1.0)
@@ -814,12 +1056,18 @@ async def complete_json(
     config: LLMConfig | None = None,
     max_tokens: int = 4096,
     retries: int = 2,
+    schema_type: str = "resume",
 ) -> dict[str, Any]:
     """Make a completion request expecting JSON response.
 
     Uses JSON mode when available, with app-level retries for content-quality
     issues (malformed JSON, truncation).  Transport retries (429, 500, timeout)
     are handled by the Router and are NOT retried again here.
+
+    Args:
+        schema_type: Expected schema — "resume", "enrichment", "diff", or
+            "keywords". Passed to _appears_truncated for context-aware truncation
+            detection and used to tailor retry hints.
     """
     router, config = get_router(config)
     model_name = get_model_name(config)
@@ -835,22 +1083,27 @@ async def complete_json(
 
     # Check if we can use JSON mode
     use_json_mode = _supports_json_mode(model_name)
+    json_mode_failed = False
 
     for attempt in range(retries + 1):
         try:
             kwargs: dict[str, Any] = {
                 "model": "primary",
                 "messages": messages,
-                # LLM-002: Increase temperature on retry for variation
-                "temperature": _get_retry_temperature(attempt),
                 "max_tokens": max_tokens,
                 "timeout": _calculate_timeout("json", max_tokens, config.provider),
             }
+            # LLM-002: Increase temperature on retry for variation
+            retry_temp = _get_retry_temperature(model_name, attempt)
+            if retry_temp is not None:
+                kwargs["temperature"] = retry_temp
             if config.reasoning_effort:
                 kwargs["reasoning_effort"] = config.reasoning_effort
 
-            # Add JSON mode if supported
-            if use_json_mode:
+            # JSON-012: Fallback to prompt-only JSON mode after JSON-mode failure.
+            # LiteLLM registry may report support for models that the upstream
+            # aggregator (OpenRouter) cannot actually serve with response_format.
+            if use_json_mode and not json_mode_failed:
                 kwargs["response_format"] = {"type": "json_object"}
 
             response = await router.acompletion(**kwargs)
@@ -867,17 +1120,26 @@ async def complete_json(
             result = json.loads(json_str)
 
             # LLM-001: Check if parsed result appears truncated
-            if isinstance(result, dict) and _appears_truncated(result):
+            if isinstance(result, dict) and _appears_truncated(result, schema_type):
                 if attempt < retries:
                     logging.warning(
                         "Parsed JSON appears truncated (attempt %d/%d), retrying",
                         attempt + 1,
                         retries + 1,
                     )
-                    messages[-1]["content"] = (
-                        prompt
-                        + "\n\nIMPORTANT: Output the COMPLETE JSON object with ALL sections including personalInfo. Do not truncate."
-                    )
+                    if schema_type == "resume":
+                        hint = (
+                            "\n\nIMPORTANT: Output the COMPLETE JSON object with ALL sections. Do not truncate."
+                        )
+                    elif schema_type == "enrichment":
+                        hint = (
+                            "\n\nIMPORTANT: Output the COMPLETE JSON object with ALL keys: items_to_enrich, questions, analysis_summary. Do not truncate."
+                        )
+                    else:
+                        hint = (
+                            "\n\nIMPORTANT: Output ONLY a valid JSON object. Start with { and end with }."
+                        )
+                    messages[-1]["content"] = prompt + hint
                     continue
                 logging.warning(
                     "Parsed JSON appears truncated on final attempt, proceeding with result"
@@ -888,6 +1150,14 @@ async def complete_json(
         except json.JSONDecodeError as e:
             # Content quality — malformed JSON, retry with prompt hint
             logging.warning(f"JSON parse failed (attempt {attempt + 1}): {e}")
+            if use_json_mode and not json_mode_failed:
+                # JSON-012: Registry claimed JSON mode support but the upstream
+                # failed to return valid JSON. Disable JSON mode for retries.
+                json_mode_failed = True
+                logging.warning(
+                    "JSON mode failed for %s, falling back to prompt-only (attempt %d)",
+                    model_name, attempt + 1,
+                )
             if attempt < retries:
                 messages[-1]["content"] = (
                     prompt
@@ -902,6 +1172,29 @@ async def complete_json(
             logging.warning(f"Content extraction failed (attempt {attempt + 1}): {e}")
             if attempt < retries:
                 continue
+            raise
+
+        except litellm.BadRequestError as e:
+            # JSON-012b: some OpenAI-compatible servers (e.g. LM Studio) report
+            # response_format support via the registry but reject
+            # {"type": "json_object"} with a 400 (issue #857). The Router does
+            # not retry bad requests, so recover here by disabling JSON mode and
+            # retrying prompt-only. Unrelated 400s (e.g. context length) still
+            # propagate.
+            if (
+                use_json_mode
+                and not json_mode_failed
+                and _is_response_format_unsupported(e)
+            ):
+                json_mode_failed = True
+                logging.warning(
+                    "Provider rejected response_format for %s; falling back to "
+                    "prompt-only JSON mode (attempt %d)",
+                    model_name,
+                    attempt + 1,
+                )
+                if attempt < retries:
+                    continue
             raise
 
         except Exception:
