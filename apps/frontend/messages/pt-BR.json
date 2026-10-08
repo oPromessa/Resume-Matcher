@@ -30,7 +30,8 @@
     "unknown": "Desconhecido",
     "keysCleared": "Chaves de API removidas com sucesso",
     "databaseReset": "Banco de dados redefinido com sucesso",
-    "popupBlocked": "Popup bloqueado. Por favor, permita popups ou abra esta URL manualmente: {url}"
+    "popupBlocked": "Popup bloqueado. Por favor, permita popups ou abra esta URL manualmente: {url}",
+    "resumeDeleted": "Este currículo foi excluído. Envie ou selecione outro currículo."
   },
   "home": {
     "brandLine1": "Resume",
@@ -92,6 +93,7 @@
     "uploadDialog": {
       "success": "Currículo enviado com sucesso.",
       "successMaster": "Currículo enviado e definido como principal.",
+      "successMasterTrack": "Currículo enviado como uma nova trilha principal.",
       "successMissingId": "Upload concluído, mas sem ID retornado.",
       "parsingFailed": "Currículo enviado, mas a análise de IA falhou. Você ainda pode personalizá-lo manualmente.",
       "failed": "Falha no upload.",
@@ -99,14 +101,47 @@
       "dropzoneSubtitle": "PDF, DOC, DOCX (Máximo 4MB)",
       "tryDifferentFile": "Tentar outro arquivo",
       "parsingFailedKeepOpen": "A análise de IA falhou. Tente outro arquivo ou feche este diálogo."
-    }
+    },
+    "errors": {
+      "loadFailed": "Não foi possível carregar os currículos. Tente novamente.",
+      "deleteFailed": "Não foi possível excluir o currículo. Seu currículo atual continua disponível."
+    },
+    "defaultBadge": "Padrão",
+    "masterTrack": "Trilha principal",
+    "setDefault": "Definir como padrão",
+    "duplicate": "Duplicar",
+    "addMasterTrack": "Adicionar trilha principal",
+    "masterLimitReached": "Até {max} currículos principais"
   },
   "builder": {
     "title": "Criar Currículo",
+    "copySuffix": "(Cópia)",
     "editMode": "Modo Edição",
     "previewMode": "Modo Visualização",
     "createAndPreview": "Criar e Visualizar",
     "unsavedDraft": "Rascunho Não Salvo",
+    "autoSave": {
+      "saving": "Sincronizando...",
+      "saved": "Todas as alterações salvas",
+      "localDraft": "Rascunho salvo localmente",
+      "saveNow": "Salvar agora",
+      "retrySave": "Tentar salvar novamente",
+      "savedButton": "Salvo",
+      "localDraftUnavailable": "Rascunho local indisponível"
+    },
+    "draftRecovery": {
+      "title": "Restaurar rascunho local?",
+      "description": "Um rascunho local do navegador é diferente da cópia salva no servidor. Restaure-o para continuar editando ou use a cópia do servidor e descarte o rascunho local.",
+      "newDescription": "Este navegador tem um rascunho de currículo não salvo. Restaure-o para continuar editando ou descarte-o para começar de novo.",
+      "restoreDraft": "Restaurar rascunho",
+      "useServer": "Usar cópia do servidor"
+    },
+    "leaveWithLocalDraft": {
+      "title": "Sair sem sincronizar?",
+      "description": "As alterações mais recentes ainda não puderam ser sincronizadas com o servidor. Um rascunho local continua salvo neste navegador, mas pode não estar disponível em outro navegador ou dispositivo.",
+      "leave": "Ir para o painel",
+      "stay": "Continuar editando"
+    },
     "personalInfo": "Informações Pessoais",
     "summary": "Resumo",
     "experience": "Experiência",
@@ -169,6 +204,7 @@
       "moveUp": "Mover para cima",
       "moveDown": "Mover para baixo",
       "deleteSection": "Excluir seção",
+      "duplicateSection": "Duplicar seção",
       "deleteTitle": "Excluir Seção",
       "deleteDescription": "Tem certeza que deseja excluir \"{name}\"? Esta ação não pode ser desfeita."
     },
@@ -176,7 +212,8 @@
       "resume": "CURRÍCULO",
       "coverLetter": "CARTA DE APRESENTAÇÃO",
       "outreach": "MENSAGEM DE CONTATO",
-      "jdMatch": "ANÁLISE DE VAGA"
+      "jdMatch": "ANÁLISE DE VAGA",
+      "interviewPrep": "PREPARAÇÃO"
     },
     "footer": {
       "moduleLabel": "Módulo de Criação de Currículo",
@@ -195,7 +232,9 @@
       "outreachDescription": "Gere uma mensagem de contato concisa para LinkedIn ou email com base no seu currículo e descrição da vaga.",
       "generateButton": "Gerar {title}",
       "coverLetterFooter": "Dica: personalize primeiro para melhores resultados.",
-      "outreachFooter": "Dica: mantenha curta e personalizada."
+      "outreachFooter": "Dica: mantenha curta e personalizada.",
+      "interviewPrepDescription": "Gere preparação para entrevista com base no currículo adaptado e na descrição da vaga.",
+      "interviewPrepFooter": "Dica: use depois de adaptar o currículo para preparar respostas verdadeiras e baseadas em evidências."
     },
     "regenerateDialog": {
       "title": "Regenerar {title}?",
@@ -240,14 +279,17 @@
         "newLabel": "Novo",
         "noContent": "Sem conteúdo",
         "applying": "Aplicando...",
-        "loading": "Gerando conteúdo aprimorado..."
+        "loading": "Gerando conteúdo aprimorado...",
+        "retryRefresh": "Tentar atualizar novamente",
+        "refreshing": "Atualizando..."
       },
       "errors": {
         "generationFailed": "Falha ao gerar o conteúdo. Tente novamente.",
         "applyFailed": "Falha ao aplicar as alterações. Tente novamente.",
         "resumeChanged": "O conteúdo do currículo mudou desde a regeneração. Regere e tente novamente.",
         "noChangesToApply": "Não há alterações para aplicar.",
-        "networkError": "Erro de rede. Verifique sua conexão."
+        "networkError": "Erro de rede. Verifique sua conexão.",
+        "refreshFailed": "As alterações foram salvas, mas não foi possível atualizar o currículo. Tente atualizar novamente."
       }
     },
     "jdMatch": {
@@ -289,7 +331,9 @@
         "descriptionPoints": "Pontos de Descrição"
       },
       "actions": {
-        "addPoint": "Adicionar Ponto"
+        "addPoint": "Adicionar Ponto",
+        "togglePointStyle": "Alternar marcador",
+        "reorderPoint": "Arraste para reordenar o ponto"
       },
       "placeholders": {
         "title": "Título",
@@ -444,11 +488,14 @@
       "editorPanel": "Painel do Editor",
       "coverLetterEditor": "Editor de Carta de Apresentação",
       "outreachEditor": "Editor de Mensagem de Contato",
-      "jdMatchAnalysis": "Análise de Correspondência de Vaga"
+      "jdMatchAnalysis": "Análise de Correspondência de Vaga",
+      "interviewPrep": "Preparação para entrevista"
     },
     "alerts": {
       "saveNotAvailable": "Salvar só está disponível ao editar um currículo existente.",
       "saveFailed": "Falha ao salvar currículo. Por favor, tente novamente.",
+      "autoSaveFailed": "Não foi possível sincronizar. O rascunho está seguro localmente.",
+      "loadFailed": "Não foi possível carregar este currículo do servidor. Atualize para tentar novamente; a edição está desativada para não sobrescrever sua cópia salva.",
       "coverLetterSaveSuccess": "Carta de apresentação salva",
       "outreachSaveSuccess": "Mensagem de contato salva",
       "downloadSuccess": "Currículo baixado",
@@ -461,7 +508,14 @@
       "coverLetterDownloadFailed": "Falha ao baixar carta de apresentação: {error}",
       "outreachSaveFailed": "Falha ao salvar mensagem de contato. Por favor, tente novamente.",
       "coverLetterGenerateFailed": "Falha ao gerar carta de apresentação: {error}",
-      "outreachGenerateFailed": "Falha ao gerar mensagem de contato: {error}"
+      "outreachGenerateFailed": "Falha ao gerar mensagem de contato: {error}",
+      "interviewPrepGenerateFailed": "Falha ao gerar preparação para entrevista: {error}"
+    },
+    "leaveWithoutDraft": {
+      "title": "Sair com alterações não salvas?",
+      "description": "Não foi possível sincronizar as alterações mais recentes com o servidor nem salvá-las neste navegador. Sair agora pode perder essas alterações.",
+      "leave": "Sair mesmo assim",
+      "stay": "Continuar editando"
     }
   },
   "enrichment": {
@@ -488,14 +542,20 @@
       "addingLabel": "Adicionando",
       "existingCount": "({count} existentes)",
       "newCount": "({count} novos)",
-      "noExistingDescription": "Sem descrição existente"
+      "noExistingDescription": "Sem descrição existente",
+      "partialFailure": "Não foi possível aprimorar alguns itens",
+      "partialFailureDescription": "Os itens listados permanecerão iguais. Você pode aplicar as melhorias concluídas e tentar os outros itens novamente mais tarde."
     },
     "complete": {
       "title": "Currículo Aprimorado!",
       "updatedCountSingular": "{count} item atualizado com sucesso",
       "updatedCountPlural": "{count} itens atualizados com sucesso",
       "updatedFallback": "Seu currículo foi atualizado com descrições aprimoradas",
-      "doneButton": "Concluído"
+      "doneButton": "Concluído",
+      "refreshFailedTitle": "Salvo — atualização necessária",
+      "refreshFailed": "As melhorias foram salvas, mas esta tela não pôde ser atualizada. Tente novamente para ver o currículo mais recente.",
+      "retryRefresh": "Tentar atualizar novamente",
+      "refreshing": "Atualizando currículo..."
     },
     "noImprovements": {
       "title": "Seu currículo está ótimo!",
@@ -503,7 +563,8 @@
     },
     "error": {
       "title": "Algo deu errado",
-      "unexpected": "Ocorreu um erro inesperado"
+      "unexpected": "Ocorreu um erro inesperado",
+      "answerRequired": "Responda a pelo menos uma pergunta antes de gerar melhorias."
     }
   },
   "tailor": {
@@ -578,10 +639,21 @@
       "jobDescriptionTooShort": "Descrição da vaga muito curta. Adicione mais detalhes e tente novamente.",
       "apiKeyError": "Sua chave de API não está funcionando. Verifique em Configurações.",
       "rateLimit": "Limite de requisições atingido. Aguarde cerca de um minuto e tente novamente.",
+      "timeout": "A prévia do currículo expirou após {minutes} minutos. Tente novamente com uma descrição de vaga mais curta ou um prompt mais simples.",
       "failedToGenerate": "Não foi possível gerar o currículo. Verifique sua chave de API em Configurações e tente novamente.",
-      "timeout": "A solicitação expirou. Tente novamente com uma descrição de vaga mais curta ou verifique sua conexão.",
       "failedToPreview": "Não foi possível pré-visualizar o currículo. Verifique sua chave de API em Configurações e tente novamente.",
-      "failedToConfirm": "Não foi possível aplicar as alterações. Tente novamente."
+      "failedToConfirm": "Não foi possível aplicar as alterações. Tente novamente.",
+      "previewUnavailable": "Esta prévia expirou ou o currículo original mudou. Gere uma nova prévia antes de salvar."
+    },
+    "selectResumeDescription": "Os marcadores são extraídos deste currículo principal.",
+    "selectionSummary": "{kept} de {total} marcadores mantidos (até {max} por cargo ou projeto)",
+    "pageFit": {
+      "fits": "Cabe em uma página",
+      "trimmed": "Marcadores extras removidos para caber em uma página: {count}",
+      "over": "Ainda excede uma página",
+      "unavailable": "Ajuste de página indisponível",
+      "finalOver": "Pode passar de uma página após a reescrita",
+      "notRechecked": "Ajuste a uma página não verificado após a reescrita"
     }
   },
   "settings": {
@@ -661,6 +733,8 @@
       "baseUrlLabel": "URL Base (opcional)",
       "baseUrlPlaceholder": "Ex: https://api.openai.com/v1",
       "baseUrlDescription": "Sobrescreva a URL base da API para usar um proxy/agregador. Deixe em branco para usar o padrão do provedor.",
+      "azureBaseUrlLabel": "Endpoint do Azure AI Foundry",
+      "azureBaseUrlDescription": "Cole o endpoint do Foundry. Implantações GPT podem usar a raiz do serviço ou /openai/v1/responses; modelos do Azure AI Inference podem usar o endpoint /models.",
       "ollamaServerUrl": "URL do Servidor Ollama",
       "ollamaServerUrlPlaceholder": "http://localhost:11434",
       "reasoningEffortLabel": "Esforço de raciocínio",
@@ -705,7 +779,11 @@
       "customPromptLabel": "Prompt personalizado (opcional)",
       "customPromptHelp": "Deve incluir estes marcadores (cada um entre chaves): job_description, resume_data, output_language. Deixe em branco para usar o prompt padrão.",
       "customPromptResetButton": "Restaurar padrão",
-      "customPromptErrorMissing": "Marcadores obrigatórios ausentes: {missing}"
+      "customPromptErrorMissing": "Marcadores obrigatórios ausentes: {missing}",
+      "interviewPrep": {
+        "label": "Preparação para entrevista",
+        "description": "Gerar automaticamente preparação para entrevista junto com currículos adaptados salvos"
+      }
     },
     "promptSettings": {
       "title": "Configurações de Prompt",
@@ -723,6 +801,7 @@
     "errors": {
       "unableToConnectBackend": "Não foi possível alcançar o servidor. Verifique se ele está rodando.",
       "apiKeyRequired": "Chave de API é necessária para o provedor selecionado.",
+      "baseUrlRequired": "{provider} requer uma URL base.",
       "unknownProvider": "Provedor desconhecido retornado do backend: {provider}",
       "unableToSaveConfiguration": "Não foi possível salvar a configuração",
       "failedToClearApiKeys": "Falha ao limpar chaves de API. Por favor, tente novamente.",
@@ -754,9 +833,19 @@
       "notProcessedYet": "O currículo ainda não foi processado. Por favor, use o recurso de Personalização para gerar um currículo estruturado.",
       "noDataAvailable": "Nenhum dado de currículo disponível.",
       "failedToLoad": "Falha ao carregar dados do currículo.",
-      "failedToDelete": "Falha ao excluir currículo. Por favor, tente novamente."
+      "failedToDelete": "Falha ao excluir currículo. Por favor, tente novamente.",
+      "failedToDownload": "Não foi possível baixar o currículo. Tente novamente.",
+      "failedToRename": "Não foi possível renomear o currículo. Tente novamente."
     },
-    "titlePlaceholder": "Digite o título do currículo..."
+    "titlePlaceholder": "Digite o título do currículo...",
+    "downloadFailedTitle": "Falha no download",
+    "renameFailedTitle": "Falha ao renomear",
+    "defaultBadge": "Principal padrão",
+    "setDefault": "Definir como principal padrão",
+    "setDefaultSuccess": "Este currículo principal agora é o padrão para personalização.",
+    "setDefaultError": "Não foi possível definir este currículo como principal padrão. Tente novamente.",
+    "duplicate": "Duplicar",
+    "duplicateError": "Não foi possível duplicar este currículo. Tente novamente."
   },
   "preview": {
     "margins": "Margens",
@@ -865,6 +954,7 @@
   },
   "a11y": {
     "removeItem": "Remover item",
+    "duplicateItem": "Duplicar item",
     "removeDescription": "Remover esta linha",
     "removeFile": "Remover arquivo"
   },
@@ -906,7 +996,11 @@
       "review": "Revisar e concluir",
       "create": "Criar currículo mestre",
       "keepAdding": "Continuar adicionando",
-      "backToDashboard": "Voltar ao painel"
+      "backToDashboard": "Voltar ao painel",
+      "openCreated": "Abrir currículo criado",
+      "retryDraftBackup": "Tentar backup local novamente",
+      "stay": "Permanecer aqui",
+      "leaveWithoutSaving": "Sair sem salvar"
     },
     "preview": {
       "label": "Rascunho ao vivo",
@@ -919,7 +1013,16 @@
     },
     "errors": {
       "turnFailed": "O assistente não conseguiu salvar essa resposta. Tente novamente.",
-      "finalizeFailed": "O assistente não conseguiu criar seu currículo mestre. Tente novamente."
+      "finalizeFailed": "O assistente não conseguiu criar seu currículo mestre. Tente novamente.",
+      "createdNavigationFailed": "Seu currículo mestre foi criado, mas esta página não conseguiu abri-lo automaticamente. Use o botão abaixo para continuar."
+    },
+    "draftStorageUnavailable": {
+      "title": "Rascunho local indisponível",
+      "description": "O progresso mais recente do assistente está apenas nesta aba. Tente o backup local novamente antes de sair ou recarregar."
+    },
+    "leaveWithoutDraft": {
+      "title": "Sair sem um backup local?",
+      "description": "O progresso mais recente do assistente será perdido se você sair ou recarregar antes que o backup local seja concluído."
     },
     "entry": {
       "kicker": "Configuração do currículo mestre",
@@ -937,9 +1040,22 @@
         "description": "Responda a perguntas objetivas e deixe o assistente montar um primeiro rascunho forte do seu currículo mestre.",
         "action": "Iniciar assistente"
       }
+    },
+    "created": {
+      "title": "Currículo mestre criado",
+      "description": "Seu currículo mestre foi criado. Abra-o para continuar editando."
     }
   },
   "tracker": {
+    "manage": "Gerenciar",
+    "manageDialog": {
+      "title": "Gerenciar colunas",
+      "description": "Escolha quais etapas aparecem no quadro.",
+      "visible": "Visível",
+      "hidden": "Oculta",
+      "lastVisibleHint": "Pelo menos uma etapa deve permanecer visível.",
+      "close": "Concluído"
+    },
     "scroll": {
       "prev": "Rolar para a esquerda",
       "next": "Rolar para a direita",
@@ -1005,6 +1121,25 @@
       "loadFailed": "Não foi possível carregar as candidaturas.",
       "moveFailed": "Não foi possível mover a candidatura.",
       "deleteFailed": "Não foi possível excluir a(s) candidatura(s)."
+    }
+  },
+  "interviewPrep": {
+    "title": "Preparação para entrevista",
+    "regenerate": "Gerar novamente",
+    "unavailableTitle": "Preparação indisponível",
+    "loadingContextDescription": "Verificando o contexto da vaga para este currículo adaptado antes de gerar.",
+    "missingContextDescription": "Este currículo adaptado não tem o contexto da vaga salvo necessário para gerar preparação para entrevista. Adapte o currículo novamente com uma descrição da vaga.",
+    "saveRequiredDescription": "Salve este currículo adaptado antes de gerar preparação para entrevista.",
+    "focusArea": "Área de foco",
+    "suggestedAnswerPoints": "Pontos sugeridos para resposta",
+    "whyItMatters": "Por que importa",
+    "preparationSuggestion": "Sugestão de preparação",
+    "sections": {
+      "roleFit": "Análise de adequação",
+      "resumeQuestions": "Perguntas baseadas no currículo",
+      "projectFollowUps": "Perguntas sobre projetos",
+      "skillGaps": "Lacunas de habilidades",
+      "talkingPoints": "Pontos de conversa"
     }
   }
 }

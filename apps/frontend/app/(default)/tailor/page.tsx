@@ -12,21 +12,35 @@ import {
   uploadJobDescriptions,
   previewImproveResume,
   confirmImproveResume,
+  fetchResumeList,
+  toPageFitSettings,
+  type ResumeListItem,
 } from '@/lib/api/resume';
+import { readStoredTemplateSettings } from '@/lib/utils/stored-template-settings';
 import { fetchPromptConfig, type PromptOption } from '@/lib/api/config';
+import { getPreviewErrorMessage } from '@/lib/utils/preview-error';
 import { Dropdown } from '@/components/ui/dropdown';
 import { useStatusCache } from '@/lib/context/status-cache';
 import { Loader2, ArrowLeft, AlertTriangle, Settings } from 'lucide-react';
 import { useTranslations } from '@/lib/i18n';
 import { DiffPreviewModal } from '@/components/tailor/diff-preview-modal';
+import { ATSScoreCard } from '@/components/tailor/ats-score-card';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { useOperationOwner } from '@/hooks/use-operation-owner';
 
 export default function TailorPage() {
-  const { t } = useTranslations();
+  const { t, locale } = useTranslations();
+  const { begin, isCurrent, invalidate } = useOperationOwner('tailor');
+  const confirmedResponses = useRef(new WeakMap<ImprovedResult, ImprovedResult>());
+  const countedResumes = useRef(new Set<string>());
+  const confirmationBusy = useRef(false);
   const [jobDescription, setJobDescription] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [masterResumeId, setMasterResumeId] = useState<string | null>(null);
+  const [masters, setMasters] = useState<ResumeListItem[]>([]);
+  // The master a preview was built from; confirm must send this, not the picker's current value.
+  const previewSourceIdRef = useRef<string | null>(null);
   const [promptOptions, setPromptOptions] = useState<PromptOption[]>([]);
   const [selectedPromptId, setSelectedPromptId] = useState('keywords');
   const [promptLoading, setPromptLoading] = useState(false);
@@ -79,12 +93,35 @@ export default function TailorPage() {
   const isLlmConfigured = !statusLoading && systemStatus?.llm_configured;
 
   useEffect(() => {
-    const storedId = localStorage.getItem('master_resume_id');
-    if (!storedId) {
-      router.push('/dashboard');
-    } else {
-      setMasterResumeId(storedId);
-    }
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const rows = await fetchResumeList(true);
+        if (cancelled) return;
+        const ready = rows.filter((r) => r.is_master && r.processing_status === 'ready');
+        const storedId = localStorage.getItem('master_resume_id');
+        const initial =
+          ready.find((r) => r.is_default_master) ??
+          ready.find((r) => r.resume_id === storedId) ??
+          ready[0];
+        if (!initial) {
+          router.push('/dashboard');
+          return;
+        }
+        setMasters(ready);
+        setMasterResumeId(initial.resume_id);
+      } catch {
+        if (cancelled) return;
+        const storedId = localStorage.getItem('master_resume_id');
+        if (storedId) setMasterResumeId(storedId);
+        else router.push('/dashboard');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [router]);
 
   useEffect(() => {
@@ -120,7 +157,8 @@ export default function TailorPage() {
   };
 
   const buildConfirmPayload = (result: ImprovedResult) => {
-    if (!masterResumeId) {
+    const sourceId = previewSourceIdRef.current ?? masterResumeId;
+    if (!sourceId) {
       throw new Error('Master resume ID is missing.');
     }
     const resumePreview = result.data.resume_preview;
@@ -136,8 +174,9 @@ export default function TailorPage() {
       throw new Error('Resume preview data is invalid.');
     }
     return {
-      resume_id: masterResumeId,
+      resume_id: sourceId,
       job_id: result.data.job_id,
+      preview_id: result.data.preview_id ?? null,
       improved_data: resumePreview as ResumeData,
       improvements:
         result.data.improvements?.map((item) => ({
@@ -147,18 +186,45 @@ export default function TailorPage() {
     };
   };
 
-  const confirmAndNavigate = async (result: ImprovedResult) => {
-    const confirmed = await confirmImproveResume(buildConfirmPayload(result));
-    incrementImprovements();
-    incrementResumes();
-    setImprovedData(confirmed);
-
-    const newResumeId = confirmed?.data?.resume_id;
-    if (newResumeId) {
-      router.push(`/resumes/${newResumeId}`);
-    } else {
-      router.push('/builder');
+  const confirmAndNavigate = async (result: ImprovedResult, token: number) => {
+    let confirmed = confirmedResponses.current.get(result);
+    if (!confirmed) {
+      const expiresAt = Date.parse(result.data.preview_expires_at ?? '');
+      if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+        throw new Error('Preview expired');
+      }
+      confirmed = await confirmImproveResume(buildConfirmPayload(result));
+      // Acknowledgement is durable even if a later client effect fails.
+      confirmedResponses.current.set(result, confirmed);
     }
+    if (!isCurrent(token)) return;
+    const newResumeId = confirmed?.data?.resume_id;
+    if (newResumeId && !countedResumes.current.has(newResumeId)) {
+      countedResumes.current.add(newResumeId);
+      incrementImprovements();
+      incrementResumes();
+    }
+    setImprovedData(confirmed);
+    router.push(newResumeId ? `/resumes/${newResumeId}` : '/builder');
+  };
+
+  const offerFreshPreview = (failure: unknown): boolean => {
+    if (!(failure instanceof Error) || !/preview expired|status (400|409)\b/i.test(failure.message))
+      return false;
+    invalidate();
+    confirmationBusy.current = false;
+    missingDiffConfirmInFlight.current = false;
+    setIsConfirming(false);
+    setIsLoading(false);
+    setShowDiffModal(false);
+    setShowMissingDiffDialog(false);
+    setPendingResult(null);
+    setMissingDiffResult(null);
+    setDiffConfirmError(null);
+    setMissingDiffError(null);
+    setError(t('tailor.errors.previewUnavailable'));
+    setShowRegenerateDialog(true);
+    return true;
   };
 
   const getGenerateValidationError = (trimmedDescription: string) => {
@@ -169,15 +235,21 @@ export default function TailorPage() {
     return null;
   };
 
-  const runGenerate = async (resumeId: string, description: string) => {
+  const runGenerate = async (resumeId: string, description: string, token: number) => {
     try {
       // 1. Upload Job Description
       // The API expects an array of strings
+      previewSourceIdRef.current = resumeId;
       const jobId = await uploadJobDescriptions([description], resumeId);
+      if (!isCurrent(token)) return;
       incrementJobs(); // Update cached counter
 
       // 2. Preview Resume
-      const result = await previewImproveResume(resumeId, jobId, selectedPromptId);
+      const result = await previewImproveResume(resumeId, jobId, selectedPromptId, {
+        maxBulletsPerEntry: 3,
+        pageFit: toPageFitSettings(readStoredTemplateSettings(), locale),
+      });
+      if (!isCurrent(token)) return;
 
       if (!result?.data?.diff_summary || !result?.data?.detailed_changes) {
         console.warn('Diff data missing for tailor preview; requesting user confirmation.');
@@ -196,29 +268,9 @@ export default function TailorPage() {
       setPendingResult(result);
       setShowDiffModal(true);
     } catch (err) {
+      if (!isCurrent(token)) return;
       console.error(err);
-      // Check for common error patterns
-      const errorMessage = err instanceof Error ? err.message : '';
-      if (
-        errorMessage.toLowerCase().includes('api key') ||
-        errorMessage.toLowerCase().includes('unauthorized') ||
-        errorMessage.toLowerCase().includes('authentication') ||
-        errorMessage.includes('401')
-      ) {
-        setError(t('tailor.errors.apiKeyError'));
-      } else if (
-        errorMessage.toLowerCase().includes('rate limit') ||
-        errorMessage.includes('429')
-      ) {
-        setError(t('tailor.errors.rateLimit'));
-      } else if (
-        errorMessage.toLowerCase().includes('timed out') ||
-        errorMessage.toLowerCase().includes('timeout')
-      ) {
-        setError(t('tailor.errors.timeout'));
-      } else {
-        setError(t('tailor.errors.failedToPreview'));
-      }
+      setError(getPreviewErrorMessage(err, t));
     }
   };
 
@@ -231,41 +283,58 @@ export default function TailorPage() {
       return;
     }
     const resumeId = masterResumeId;
+    const token = begin();
+    if (token === null) return;
     setIsLoading(true);
     setError(null);
     startTimer();
     try {
-      await runGenerate(resumeId, trimmedDescription);
+      await runGenerate(resumeId, trimmedDescription, token);
     } finally {
-      setIsLoading(false);
-      stopTimer();
+      if (isCurrent(token)) {
+        setIsLoading(false);
+        stopTimer();
+      }
     }
   };
 
   // User confirms changes
   const handleConfirmChanges = async () => {
-    if (!pendingResult || isConfirming) return;
+    if (!pendingResult || confirmationBusy.current) return;
+    const token = begin();
+    if (token === null) return;
+    confirmationBusy.current = true;
 
     setIsConfirming(true);
     setError(null);
     setDiffConfirmError(null);
 
     try {
-      await confirmAndNavigate(pendingResult);
+      await confirmAndNavigate(pendingResult, token);
+      if (!isCurrent(token)) return;
       setShowDiffModal(false);
       setPendingResult(null);
     } catch (err) {
+      if (!isCurrent(token)) return;
       console.error(err);
+      if (offerFreshPreview(err)) return;
       const errorMessage = t('tailor.errors.failedToConfirm');
       setError(errorMessage);
       setDiffConfirmError(errorMessage);
     } finally {
-      setIsConfirming(false);
+      if (isCurrent(token)) {
+        confirmationBusy.current = false;
+        setIsConfirming(false);
+      }
     }
   };
 
   // User rejects changes
   const handleRejectChanges = () => {
+    if (confirmationBusy.current) return;
+    invalidate();
+    confirmationBusy.current = false;
+    setIsConfirming(false);
     setShowDiffModal(false);
     setPendingResult(null);
     setDiffConfirmError(null);
@@ -273,12 +342,18 @@ export default function TailorPage() {
   };
 
   const handleCloseDiffModal = () => {
+    if (confirmationBusy.current) return;
+    invalidate();
+    confirmationBusy.current = false;
+    setIsConfirming(false);
     setShowDiffModal(false);
     setPendingResult(null);
     setDiffConfirmError(null);
   };
 
   const handleCloseMissingDiffDialog = () => {
+    invalidate();
+    setIsLoading(false);
     setShowMissingDiffDialog(false);
     setMissingDiffResult(null);
     setMissingDiffError(null);
@@ -287,21 +362,28 @@ export default function TailorPage() {
 
   const handleMissingDiffConfirm = async () => {
     if (!missingDiffResult || isLoading || missingDiffConfirmInFlight.current) return;
+    const token = begin();
+    if (token === null) return;
     missingDiffConfirmInFlight.current = true;
     setIsLoading(true);
     setError(null);
     setMissingDiffError(null);
     try {
-      await confirmAndNavigate(missingDiffResult);
+      await confirmAndNavigate(missingDiffResult, token);
+      if (!isCurrent(token)) return;
       handleCloseMissingDiffDialog();
     } catch (err) {
+      if (!isCurrent(token)) return;
       console.error(err);
+      if (offerFreshPreview(err)) return;
       const errorMessage = t('tailor.errors.failedToConfirm');
       setError(errorMessage);
       setMissingDiffError(errorMessage);
     } finally {
-      missingDiffConfirmInFlight.current = false;
-      setIsLoading(false);
+      if (isCurrent(token)) {
+        missingDiffConfirmInFlight.current = false;
+        setIsLoading(false);
+      }
     }
   };
 
@@ -315,14 +397,18 @@ export default function TailorPage() {
       return;
     }
     const resumeId = masterResumeId;
+    const token = begin();
+    if (token === null) return;
     setIsLoading(true);
     setError(null);
     startTimer();
     try {
-      await runGenerate(resumeId, trimmedDescription);
+      await runGenerate(resumeId, trimmedDescription, token);
     } finally {
-      setIsLoading(false);
-      stopTimer();
+      if (isCurrent(token)) {
+        setIsLoading(false);
+        stopTimer();
+      }
     }
   };
 
@@ -372,6 +458,20 @@ export default function TailorPage() {
         )}
 
         <div className="space-y-6">
+          {masters.length > 1 && (
+            <Dropdown
+              label={t('tailor.selectResume')}
+              description={t('tailor.selectResumeDescription')}
+              options={masters.map((m) => ({
+                id: m.resume_id,
+                label: m.title || m.filename || m.resume_id,
+              }))}
+              value={masterResumeId ?? ''}
+              onChange={setMasterResumeId}
+              disabled={isLoading || promptLoading || showDiffModal}
+            />
+          )}
+
           <Dropdown
             options={
               promptOptions.length > 0
@@ -423,7 +523,7 @@ export default function TailorPage() {
           </div>
 
           {error && (
-            <div className="p-4 bg-red-50 border border-red-200 text-red-700 text-sm font-mono flex items-center gap-2">
+            <div className="p-4 bg-red-100 border-2 border-red-600 text-red-600 text-sm font-mono flex items-center gap-2">
               <span>!</span> {error}
             </div>
           )}
@@ -431,7 +531,13 @@ export default function TailorPage() {
           <Button
             size="lg"
             onClick={handleGenerate}
-            disabled={isLoading || statusLoading || !jobDescription.trim() || !isLlmConfigured}
+            disabled={
+              isLoading ||
+              statusLoading ||
+              !jobDescription.trim() ||
+              !isLlmConfigured ||
+              !masterResumeId
+            }
             className="w-full"
           >
             {isLoading ? (
@@ -456,6 +562,13 @@ export default function TailorPage() {
         </div>
       </div>
 
+      {/* ATS Score Breakdown — shown once a preview result is available */}
+      {pendingResult?.data?.ats_score && (
+        <div className="w-full max-w-4xl mt-6">
+          <ATSScoreCard atsScore={pendingResult.data.ats_score} />
+        </div>
+      )}
+
       {/* Diff preview modal */}
       {showDiffModal && pendingResult && (
         <DiffPreviewModal
@@ -467,6 +580,7 @@ export default function TailorPage() {
           diffSummary={pendingResult?.data?.diff_summary}
           detailedChanges={pendingResult?.data?.detailed_changes}
           errorMessage={diffConfirmError ?? undefined}
+          selectionSummary={pendingResult?.data?.bullet_selection}
         />
       )}
 
@@ -484,7 +598,7 @@ export default function TailorPage() {
       <ConfirmDialog
         open={showMissingDiffDialog}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && !missingDiffConfirmInFlight.current) {
             handleCloseMissingDiffDialog();
           }
         }}
@@ -495,8 +609,11 @@ export default function TailorPage() {
         variant="warning"
         closeOnConfirm={false}
         onConfirm={handleMissingDiffConfirm}
-        onCancel={handleCloseMissingDiffDialog}
+        onCancel={() => {
+          if (!missingDiffConfirmInFlight.current) handleCloseMissingDiffDialog();
+        }}
         confirmDisabled={isLoading || !missingDiffResult}
+        cancelDisabled={isLoading}
         errorMessage={missingDiffError ?? undefined}
       />
     </div>

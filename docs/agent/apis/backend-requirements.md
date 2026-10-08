@@ -27,8 +27,8 @@ GET /status           → {status, llm_configured, llm_healthy, database_stats}
 GET /config/llm-api-key    → {provider, model, api_key(masked), api_base?}
 PUT /config/llm-api-key    ← {provider, model, api_key, api_base?}
 POST /config/llm-test      → {healthy, provider, model}
-GET /config/features       → {enable_cover_letter, enable_outreach_message}
-PUT /config/features       ← {enable_cover_letter?, enable_outreach_message?}
+GET /config/features       → {enable_cover_letter, enable_outreach_message, enable_interview_prep}
+PUT /config/features       ← {enable_cover_letter?, enable_outreach_message?, enable_interview_prep?}
 ```
 
 ### Resumes
@@ -37,12 +37,21 @@ PUT /config/features       ← {enable_cover_letter?, enable_outreach_message?}
 POST /resumes/upload       ← multipart/form-data {file}
                            → {resume_id}
 GET /resumes?resume_id=    → Resume object
-GET /resumes/list          → [{resume_id, filename, is_master, created_at}]
-PATCH /resumes/{id}        ← {processed_data, cover_letter?, outreach_message?}
+GET /resumes/list?include_master=
+                           → {request_id, data: [{resume_id, filename, is_master, is_default_master,
+                              parent_id, processing_status, created_at, updated_at, title}]}
+                              (include_master defaults to false: masters are listed only with true)
+PATCH /resumes/{id}        ← ResumeData
 DELETE /resumes/{id}       → {message}
 GET /resumes/{id}/pdf      → application/pdf
+POST /resumes/{id}/default → {resume_id, is_default_master}   (masters only; 400 otherwise)
+POST /resumes/{id}/duplicate → 201 {resume_id, title, is_master, is_default_master, parent_id}
 POST /resumes/improve      ← {resume_id, job_id}
-                           → {data, cover_letter?, outreach_message?}
+                           → {data, cover_letter?, outreach_message?, interview_prep?}
+POST /resumes/improve/preview ← {resume_id, job_id, prompt_id?, max_bullets_per_entry?, page_fit?}
+                           → {request_id, data: {request_id, preview_id, preview_expires_at, resume_preview, ..., bullet_selection?}}
+POST /resumes/{id}/generate-interview-prep
+                           → {interview_prep, message}
 ```
 
 ### Jobs
@@ -68,9 +77,28 @@ GET /jobs/{id}             → {job_id, content, created_at}
     "additional": {...}
   },
   "is_master": true,
+  "is_default_master": true,
   "processing_status": "ready|processing|failed",
   "cover_letter": "text or null",
-  "outreach_message": "text or null"
+  "outreach_message": "text or null",
+  "interview_prep": "structured object or null"
+}
+```
+
+### ResumeData
+`PATCH /resumes/{id}` accepts the structured resume payload stored in
+`processed_data`, for example:
+
+```json
+{
+  "personalInfo": {...},
+  "summary": "...",
+  "workExperience": [...],
+  "education": [...],
+  "personalProjects": [...],
+  "additional": {...},
+  "customSections": {...},
+  "sectionMeta": [...]
 }
 ```
 

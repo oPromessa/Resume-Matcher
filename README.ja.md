@@ -6,7 +6,7 @@
 
 [English](README.md) | [Español](README.es.md) | [简体中文](README.zh-CN.md) | **日本語**
 
-[𝙹𝚘𝚒𝚗 𝙳𝚒𝚜𝚌𝚘𝚛𝚍](https://dsc.gg/resume-matcher) ✦ [𝚆𝚎𝚋𝚜𝚒𝚝𝚎](https://resumematcher.fyi) ✦ [𝙷𝚘𝚠 𝚝𝚘 𝙸𝚗𝚜𝚝𝚊𝚕𝚕](https://resumematcher.fyi/docs/installation) ✦ [𝙲𝚘𝚗𝚝𝚛𝚒𝚋𝚞𝚝𝚘𝚛𝚜](#contributors) ✦ [𝚂𝚙𝚘𝚗𝚜𝚘𝚛](#sponsor-resume-matcher) ✦ [𝚃𝚠𝚒𝚝𝚝𝚎𝚛/𝚇](https://twitter.com/srbhrai) ✦ [𝙻𝚒𝚗𝚔𝚎𝚍𝙸𝚗](https://www.linkedin.com/company/resume-matcher/) ✦ [𝙲𝚛𝚎𝚊𝚝𝚘𝚛](https://srbhr.com)
+[𝙹𝚘𝚒𝚗 𝙳𝚒𝚜𝚌𝚘𝚛𝚍](https://dsc.gg/resume-matcher) ✦ [𝚆𝚎𝚋𝚜𝚒𝚝𝚎](https://resumematcher.fyi) ✦ [𝙷𝚘𝚠 𝚝𝚘 𝙸𝚗𝚜𝚝𝚊𝚕𝚕](https://resumematcher.fyi/docs/installation) ✦ [𝙲𝚘𝚗𝚝𝚛𝚒𝚋𝚞𝚝𝚘𝚛𝚜](#contributors) ✦ [𝚂𝚙𝚘𝚗𝚜𝚘𝚛](#sponsors) ✦ [𝚃𝚠𝚒𝚝𝚝𝚎𝚛/𝚇](https://twitter.com/srbhrai) ✦ [𝙻𝚒𝚗𝚔𝚎𝚍𝙸𝚗](https://www.linkedin.com/company/resume-matcher/) ✦ [𝙲𝚛𝚎𝚊𝚝𝚘𝚛](https://srbhr.com)
 
 求人ごとに最適化した履歴書を、AI の提案で作成できます。Ollama を使ってローカルで動かすことも、API 経由でお気に入りの LLM プロバイダに接続することも可能です。
 
@@ -19,7 +19,7 @@
 <div align="center">
 
 ![Stars](https://img.shields.io/github/stars/srbhr/Resume-Matcher?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8)
-![Apache 2.0](https://img.shields.io/github/license/srbhr/Resume-Matcher?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8) ![Forks](https://img.shields.io/github/forks/srbhr/Resume-Matcher?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8) ![version](https://img.shields.io/badge/Version-1.2%20Nightvision%20-FFF?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8)
+![Apache 2.0](https://img.shields.io/github/license/srbhr/Resume-Matcher?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8) ![Forks](https://img.shields.io/github/forks/srbhr/Resume-Matcher?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8) ![version](https://img.shields.io/badge/Version-1.3%20Crescendolls%20-FFF?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8)
 
 [![Discord](https://img.shields.io/discord/1122069176962531400?labelColor=F0F0E8&logo=discord&logoColor=1d4ed8&style=for-the-badge&color=1d4ed8)](https://dsc.gg/resume-matcher) [![Website](https://img.shields.io/badge/website-Resume%20Matcher-FFF?labelColor=F0F0E8&style=for-the-badge&color=1d4ed8)](https://resumematcher.fyi) [![LinkedIn](https://img.shields.io/badge/LinkedIn-Resume%20Matcher-FFF?labelColor=F0F0E8&logo=LinkedIn&style=for-the-badge&color=1d4ed8)](https://www.linkedin.com/company/resume-matcher/)
 
@@ -31,7 +31,15 @@
 
 > \[!IMPORTANT]
 >
-> 本プロジェクトはアクティブに開発中です。新機能は継続的に追加され、コミュニティからのコントリビューションも歓迎しています。提案や機能要望があれば、GitHub に Issue を立てるか、[Discord](https://dsc.gg/resume-matcher) でご相談ください。
+> 本プロジェクトには皆さまの支援が必要です。少額でもご寄付いただけると、Resume Matcher の開発と改善を続ける力になります。
+
+<div align="center">
+
+[![Sponsor on GitHub](https://img.shields.io/github/sponsors/srbhr?style=for-the-badge&label=Sponsor&color=1d4ed8&labelColor=F0F0E8&logo=github&logoColor=black)](https://github.com/sponsors/srbhr) [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&color=1d4ed8&labelColor=F0F0E8&logoColor=black)](https://www.buymeacoffee.com/srbhr)
+
+**企業としてのスポンサーをご検討ですか？** あなたのロゴを 27k 人超の開発者に届けましょう → **[スポンサーになる ↓](#sponsors)**
+
+</div>
 
 ## はじめに
 
@@ -60,11 +68,17 @@ Resume Matcher は、まず「マスター履歴書」を作り、それを各�
 
 Star を付けていただけると開発の励みになります（リリース通知も受け取れます）。
 
+<a id="sponsors"></a>
+
 ## スポンサー
 
 ![sponsors](assets/sponsors.png)
 
-スポンサーの皆さまに感謝します。Resume Matcher が役立ったと感じたら、[**GitHub Sponsors**](https://github.com/sponsors/srbhr) での支援をご検討ください。継続的な開発と改善につながります。
+Resume Matcher は無料かつオープンソースで、スポンサーと支援者の皆さまによって支えられています。役立つと感じたら、開発の支援をご検討ください。
+
+### Resume Matcher を支える企業
+
+企業ティアでスポンサーになると、**あなたのロゴ・リンク・紹介文がここに掲載されます** —— **27k 超の Star と 4.9k の Fork** を持つコミュニティに向けて。[Trendshift](https://trendshift.io/repositories/565) や [Vercel OSS プログラム](https://vercel.com/oss) にも掲載されています。
 
 | Sponsor | Description |
 |---------|-------------|
@@ -72,14 +86,18 @@ Star を付けていただけると開発の励みになります（リリース
 | [Vercel](https://vercel.com?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) | Resume Matcher は Vercel OSS // Summer 2025 プログラムの一部です 🌐 [vercel.com](https://vercel.com?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) |
 | [Cubic.dev](https://cubic.dev?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) | Cubic は Resume Matcher に PR レビューを提供しています 🌐 [cubic.dev](https://cubic.dev?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) |
 | [Kilo Code](https://kilo.ai?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) | Kilo Code は Resume Matcher に AI コードレビューとコーディングクレジットを提供しています 🌐 [kilo.ai](https://kilo.ai?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) |
+| [ZanReal](https://zanreal.com/?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) | ZanReal は AI 駆動の開発企業で、戦略・UX から DevOps まで、スケーラブルなクラウドソリューションを構築し、チームがより速くリリースしアイデアを本番へと導く支援をしています。 🌐 [zanreal.com](https://zanreal.com/?utm_source=resumematcher&utm_medium=github&utm_campaign=sponsors) |
+| **✦ あなたの企業のロゴをここに** | 27k 超の開発者と 4.9k の Fork にリーチ。**[スポンサーになる →](https://github.com/sponsors/srbhr)** |
+
+スポンサーシップがプロジェクトにどのように役立つかについての詳細は、[Sponsorship Guide](https://resumematcher.fyi/docs/sponsoring) をご覧ください。ReadME およびウェブサイトにて特別に感謝の意を表します。
 
 <a id="support-the-development-by-donating"></a>
 
-## Resume Matcher を支援する
+### 個人として支援する
 
 ![donate](assets/supporting_resume_matcher.png)
 
-スポンサーシップがプロジェクトにどのように役立つかについての詳細は、[Sponsorship Guide](https://resumematcher.fyi/docs/sponsoring) をご覧ください。ReadME およびウェブサイトにて特別に感謝の意を表します。
+少額の支援でも Resume Matcher を無料に保ち、新機能の開発を支えます —— ReadME とウェブサイトにて感謝の意をお伝えします。
 
 | プラットフォーム | リンク |
 |------------------|--------|
@@ -254,8 +272,8 @@ docker run srbhr/resume-matcher:latest
 <details>
   <summary><kbd>Star の推移</kbd></summary>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=srbhr/resume-matcher&theme=dark&type=Date">
-    <img width="100%" src="https://api.star-history.com/svg?repos=srbhr/resume-matcher&theme=dark&type=Date">
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=srbhr/resume-matcher&theme=dark&type=Date">
+    <img width="100%" src="https://star-history.dera.page/svg?repos=srbhr/resume-matcher&theme=dark&type=Date">
   </picture>
 </details>
 

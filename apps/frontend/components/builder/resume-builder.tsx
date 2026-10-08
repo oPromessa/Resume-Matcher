@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, Suspense, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, Suspense, useCallback, useMemo, useRef } from 'react';
 import Image from 'next/image';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { type ResumeData } from '@/components/dashboard/resume-component';
@@ -11,6 +11,7 @@ import { OutreachEditor } from './outreach-editor';
 import { CoverLetterPreview } from './cover-letter-preview';
 import { OutreachPreview } from './outreach-preview';
 import { GeneratePrompt } from './generate-prompt';
+import { InterviewPrepView } from './interview-prep-view';
 import { Button } from '@/components/ui/button';
 import { RetroTabs } from '@/components/ui/retro-tabs';
 import { ConfirmDialog, type ConfirmDialogProps } from '@/components/ui/confirm-dialog';
@@ -25,7 +26,10 @@ import {
   Sparkles,
   Loader2,
 } from 'lucide-react';
-import { useResumePreview } from '@/components/common/resume_previewer_context';
+import {
+  useResumePreview,
+  type InterviewPrepData,
+} from '@/components/common/resume_previewer_context';
 import { PaginatedPreview } from '@/components/preview';
 import {
   downloadResumePdf,
@@ -38,24 +42,62 @@ import {
   updateOutreachMessage,
   generateCoverLetter,
   generateOutreachMessage,
+  generateInterviewPrep,
   fetchJobDescription,
 } from '@/lib/api/resume';
 import { JDComparisonView } from './jd-comparison-view';
 import { RegenerateWizard } from './regenerate-wizard';
 import { useRegenerateWizard } from '@/hooks/use-regenerate-wizard';
 import { useTranslations } from '@/lib/i18n';
-import { type TemplateSettings, DEFAULT_TEMPLATE_SETTINGS } from '@/lib/types/template-settings';
+import { type TemplateSettings } from '@/lib/types/template-settings';
+import {
+  TEMPLATE_SETTINGS_STORAGE_KEY,
+  readStoredTemplateSettings,
+} from '@/lib/utils/stored-template-settings';
 import { withLocalizedDefaultSections } from '@/lib/utils/section-helpers';
 import { useLanguage } from '@/lib/context/language-context';
 import { buildResumeFilename, downloadBlobAsFile, openUrlInNewTab } from '@/lib/utils/download';
+import { normalizeResumeForRender, normalizeResumeForSave } from '@/lib/utils/resume-normalization';
+import {
+  buildResumeDraft,
+  getResumeDraftStorageKey,
+  LEGACY_RESUME_DRAFT_STORAGE_KEY,
+  parseResumeDraft,
+  isResumeDataShape,
+  safeStorage,
+  shouldPromptForDraftRestore,
+  type ResumeDraftEnvelope,
+} from '@/lib/utils/resume-draft-storage';
 import type { RegenerateItemInput } from '@/lib/api/enrichment';
+import { clearResumeWizardCompletion } from '@/lib/utils/resume-wizard-storage';
+import {
+  clearAttachmentDraft,
+  readAttachmentDraft,
+  writeAttachmentDraft,
+  type AttachmentDraftEnvelope,
+} from '@/lib/utils/attachment-draft-storage';
 
-type TabId = 'resume' | 'cover-letter' | 'outreach' | 'jd-match';
+type TabId = 'resume' | 'cover-letter' | 'outreach' | 'interview-prep' | 'jd-match';
+type JobContextStatus = 'idle' | 'loading' | 'available' | 'missing';
 
-const STORAGE_KEY = 'resume_builder_draft';
-const SETTINGS_STORAGE_KEY = 'resume_builder_settings';
+const TAB_IDS: TabId[] = ['resume', 'cover-letter', 'outreach', 'interview-prep', 'jd-match'];
+const RESUME_AUTOSAVE_DEBOUNCE_MS = 2500;
+const RESUME_AUTOSAVE_MAX_WAIT_MS = 12000;
+// Floor for the computed delay. Without it, once an unsynced streak exceeds the
+// max wait the delay pins to 0 and every keystroke schedules an immediate
+// full-document PATCH.
+// This floor deliberately wins over the remaining max-wait budget, so a save
+// can land up to MIN_DELAY after MAX_WAIT elapses. MAX_WAIT is a target for
+// how long edits may stay unsynced, not a hard deadline — dropping the floor
+// to honour it exactly is what produced one PATCH per keystroke.
+const RESUME_AUTOSAVE_MIN_DELAY_MS = 500;
 
 type Translate = (key: string, params?: Record<string, string | number>) => string;
+
+const getTabFromSearchParams = (searchParams: Pick<URLSearchParams, 'get'>): TabId => {
+  const tab = searchParams.get('tab');
+  return TAB_IDS.includes(tab as TabId) ? (tab as TabId) : 'resume';
+};
 
 const buildInitialData = (t: Translate): ResumeData => ({
   personalInfo: {
@@ -79,6 +121,57 @@ const buildInitialData = (t: Translate): ResumeData => ({
     awards: [],
   },
 });
+
+type StoredResumeDraft = ResumeDraftEnvelope & { storageKey: string };
+
+const withStorageKey = (
+  draft: ResumeDraftEnvelope | null,
+  storageKey: string
+): StoredResumeDraft | null => {
+  return draft ? { ...draft, storageKey } : null;
+};
+
+const readStoredResumeDraft = (resumeId: string | null): StoredResumeDraft | null => {
+  const scopedKey = getResumeDraftStorageKey(resumeId);
+  const scopedDraft = withStorageKey(
+    parseResumeDraft(safeStorage.get(scopedKey), resumeId),
+    scopedKey
+  );
+  if (scopedDraft) {
+    return scopedDraft;
+  }
+
+  const legacyDraft = withStorageKey(
+    parseResumeDraft(safeStorage.get(LEGACY_RESUME_DRAFT_STORAGE_KEY), resumeId, Date.now(), {
+      allowLegacyPlainData: !resumeId,
+    }),
+    LEGACY_RESUME_DRAFT_STORAGE_KEY
+  );
+
+  return legacyDraft;
+};
+
+const writeStoredResumeDraft = (resumeId: string | null, data: ResumeData): boolean => {
+  try {
+    return safeStorage.set(
+      getResumeDraftStorageKey(resumeId),
+      JSON.stringify(buildResumeDraft(resumeId, data))
+    );
+  } catch {
+    return false;
+  }
+};
+
+const clearStoredResumeDraft = (resumeId: string | null): void => {
+  // Only clear this resume's own scoped key. Removing the legacy key here too
+  // would destroy a pre-upgrade draft for a *different* (new, unsaved) resume,
+  // which the read path deliberately only surfaces when there is no resumeId.
+  safeStorage.remove(getResumeDraftStorageKey(resumeId));
+};
+
+const clearResumeDraftStorageKey = (storageKey: string): void => {
+  safeStorage.remove(storageKey);
+};
 
 const ResumeBuilderContent = () => {
   const { t } = useTranslations();
@@ -110,23 +203,50 @@ const ResumeBuilderContent = () => {
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [lastSavedData, setLastSavedData] = useState<ResumeData>(() => initialData);
   const [isSaving, setIsSaving] = useState(false);
+  const [isAutoSaving, setIsAutoSaving] = useState(false);
+  const [autoSaveError, setAutoSaveError] = useState<string | null>(null);
+  const [lastAutoSavedAt, setLastAutoSavedAt] = useState<number | null>(null);
+  const [pendingDraftRestore, setPendingDraftRestore] = useState<StoredResumeDraft | null>(null);
+  const [pendingAttachmentDraftRestore, setPendingAttachmentDraftRestore] =
+    useState<AttachmentDraftEnvelope | null>(null);
+  const [showLeaveWithLocalDraftDialog, setShowLeaveWithLocalDraftDialog] = useState(false);
+  const [hasCurrentLocalDraft, setHasCurrentLocalDraft] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
-  const [, setLoadingState] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle');
-  const [templateSettings, setTemplateSettings] =
-    useState<TemplateSettings>(DEFAULT_TEMPLATE_SETTINGS);
+  const [loadingState, setLoadingState] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle');
+  const [templateSettings, setTemplateSettings] = useState<TemplateSettings>(
+    readStoredTemplateSettings
+  );
   const { improvedData } = useResumePreview();
   const improvedPreview = improvedData?.data?.resume_preview;
   const improvedCoverLetter = improvedData?.data?.cover_letter;
   const improvedOutreach = improvedData?.data?.outreach_message;
+  const improvedInterviewPrep = improvedData?.data?.interview_prep ?? null;
   const searchParams = useSearchParams();
   const router = useRouter();
   const resumeId = searchParams.get('id');
+  // Monotonic edit counter. It is deliberately never reset: two savers can be
+  // in flight (a queued manual flush behind an autosave), and resetting it to 0
+  // on whichever finishes first invalidated the other's captured baseline, so a
+  // save that actually succeeded reported failure. "Everything is synced" is
+  // now `editVersionRef === syncedVersionRef`, which no other saver can forge.
+  const editVersionRef = useRef(0);
+  const syncedVersionRef = useRef(0);
+  const resumeSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const unsyncedSinceRef = useRef<number | null>(null);
+  const documentIsActiveRef = useRef(true);
+
+  useEffect(() => {
+    documentIsActiveRef.current = true;
+    return () => {
+      documentIsActiveRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (resumeId || hasUnsavedChanges || improvedPreview) {
       return;
     }
-    const savedDraft = localStorage.getItem(STORAGE_KEY);
+    const savedDraft = readStoredResumeDraft(null);
     if (savedDraft) {
       return;
     }
@@ -135,13 +255,32 @@ const ResumeBuilderContent = () => {
   }, [initialData, resumeId, hasUnsavedChanges, improvedPreview]);
 
   // Tab state
-  const [activeTab, setActiveTab] = useState<TabId>('resume');
+  const [activeTab, setActiveTab] = useState<TabId>(() => getTabFromSearchParams(searchParams));
+
+  useEffect(() => {
+    setActiveTab(getTabFromSearchParams(searchParams));
+  }, [searchParams]);
 
   // Cover letter & outreach state
   const [coverLetter, setCoverLetter] = useState('');
   const [outreachMessage, setOutreachMessage] = useState('');
+  const [interviewPrep, setInterviewPrep] = useState<InterviewPrepData | null>(null);
   const [isCoverLetterSaving, setIsCoverLetterSaving] = useState(false);
   const [isOutreachSaving, setIsOutreachSaving] = useState(false);
+  const [hasUnsavedCoverLetter, setHasUnsavedCoverLetter] = useState(false);
+  const [hasUnsavedOutreach, setHasUnsavedOutreach] = useState(false);
+  const [hasCurrentAttachmentDraft, setHasCurrentAttachmentDraft] = useState(false);
+  const hasCurrentRecoveryDraft =
+    (!hasUnsavedChanges || hasCurrentLocalDraft) &&
+    (!(hasUnsavedCoverLetter || hasUnsavedOutreach) || hasCurrentAttachmentDraft);
+  const attachmentValuesRef = useRef({ coverLetter: '', outreachMessage: '' });
+  const attachmentBaselinesRef = useRef({ coverLetter: '', outreachMessage: '' });
+  const coverLetterEditVersionRef = useRef(0);
+  const outreachEditVersionRef = useRef(0);
+  const coverLetterSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const coverLetterSaveCountRef = useRef(0);
+  const outreachSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const outreachSaveCountRef = useRef(0);
   const [isCopied, setIsCopied] = useState(false);
   const [resumeTitle, setResumeTitle] = useState<string | null>(null);
 
@@ -149,12 +288,15 @@ const ResumeBuilderContent = () => {
   const [isTailoredResume, setIsTailoredResume] = useState(false);
   const [isGeneratingCoverLetter, setIsGeneratingCoverLetter] = useState(false);
   const [isGeneratingOutreach, setIsGeneratingOutreach] = useState(false);
+  const [isGeneratingInterviewPrep, setIsGeneratingInterviewPrep] = useState(false);
+  const [interviewPrepError, setInterviewPrepError] = useState<string | null>(null);
   const [showRegenerateDialog, setShowRegenerateDialog] = useState<
-    'cover-letter' | 'outreach' | null
+    'cover-letter' | 'outreach' | 'interview-prep' | null
   >(null);
 
   // JD comparison state
   const [jobDescription, setJobDescription] = useState<string | null>(null);
+  const [jobContextStatus, setJobContextStatus] = useState<JobContextStatus>('idle');
 
   // AI Regenerate wizard
   const regenerateWizard = useRegenerateWizard({
@@ -174,6 +316,8 @@ const ResumeBuilderContent = () => {
           setResumeData(data.processed_resume as ResumeData);
           setLastSavedData(data.processed_resume as ResumeData);
           setHasUnsavedChanges(false);
+          syncedVersionRef.current = editVersionRef.current;
+          unsyncedSinceRef.current = null;
         }
       } catch (error) {
         console.error('Failed to reload resume after applying regenerated changes:', error);
@@ -182,50 +326,57 @@ const ResumeBuilderContent = () => {
       }
     },
     onError: (errorMessage) => {
-      console.error('Error during regeneration or applying regenerated changes:', errorMessage);
-
       if (/network|fetch/i.test(errorMessage) || errorMessage.includes('Failed to fetch')) {
+        console.warn('Network error during regeneration or apply:', errorMessage);
         showNotification(t('builder.regenerate.errors.networkError'), 'danger');
         return;
       }
 
       if (/resume content changed|uniquely matched|please regenerate/i.test(errorMessage)) {
+        console.warn('Regenerated changes were based on a stale resume snapshot:', errorMessage);
         showNotification(t('builder.regenerate.errors.resumeChanged'), 'danger');
         return;
       }
 
       if (/generate/i.test(errorMessage)) {
+        console.warn('Generation failed:', errorMessage);
         showNotification(t('builder.regenerate.errors.generationFailed'), 'danger');
         return;
       }
 
+      console.error('Error during regeneration or applying regenerated changes:', errorMessage);
       showNotification(t('builder.regenerate.errors.applyFailed'), 'danger');
     },
   });
 
-  // Build regenerate items from resume data
+  const canonicalResumeDataForPreview = useMemo(
+    () => normalizeResumeForRender(resumeData),
+    [resumeData]
+  );
+
+  // Build regenerate items from canonical resume data so apply checks match the saved snapshot.
   const experienceItemsForRegenerate: RegenerateItemInput[] = useMemo(() => {
-    return (resumeData.workExperience || []).map((exp, idx) => ({
+    return (canonicalResumeDataForPreview.workExperience || []).map((exp, idx) => ({
       item_id: `exp_${idx}`,
       item_type: 'experience' as const,
       title: exp.title ?? '',
       subtitle: exp.company || undefined,
       current_content: Array.isArray(exp.description) ? exp.description : [],
     }));
-  }, [resumeData.workExperience]);
+  }, [canonicalResumeDataForPreview.workExperience]);
 
   const projectItemsForRegenerate: RegenerateItemInput[] = useMemo(() => {
-    return (resumeData.personalProjects || []).map((proj, idx) => ({
+    return (canonicalResumeDataForPreview.personalProjects || []).map((proj, idx) => ({
       item_id: `proj_${idx}`,
       item_type: 'project' as const,
       title: proj.name ?? '',
       subtitle: proj.role || undefined,
       current_content: Array.isArray(proj.description) ? proj.description : [],
     }));
-  }, [resumeData.personalProjects]);
+  }, [canonicalResumeDataForPreview.personalProjects]);
 
   const skillsItemForRegenerate: RegenerateItemInput | null = useMemo(() => {
-    const skills = resumeData.additional?.technicalSkills;
+    const skills = canonicalResumeDataForPreview.additional?.technicalSkills;
     if (skills && skills.length > 0) {
       return {
         item_id: 'skills',
@@ -235,122 +386,160 @@ const ResumeBuilderContent = () => {
       };
     }
     return null;
-  }, [resumeData.additional?.technicalSkills, t]);
-
+  }, [canonicalResumeDataForPreview.additional?.technicalSkills, t]);
   const localizedResumeDataForPreview = useMemo(
-    () => withLocalizedDefaultSections(resumeData, t),
-    [resumeData, t]
+    () => withLocalizedDefaultSections(canonicalResumeDataForPreview, t),
+    [canonicalResumeDataForPreview, t]
   );
-
-  // Load template settings from localStorage on mount
-  useEffect(() => {
-    const savedSettings = localStorage.getItem(SETTINGS_STORAGE_KEY);
-    if (savedSettings) {
-      try {
-        const parsed = JSON.parse(savedSettings);
-        setTemplateSettings({
-          ...DEFAULT_TEMPLATE_SETTINGS,
-          ...parsed,
-          margins: { ...DEFAULT_TEMPLATE_SETTINGS.margins, ...parsed.margins },
-          spacing: { ...DEFAULT_TEMPLATE_SETTINGS.spacing, ...parsed.spacing },
-          fontSize: { ...DEFAULT_TEMPLATE_SETTINGS.fontSize, ...parsed.fontSize },
-        });
-      } catch {
-        // Use defaults
-      }
-    }
-  }, []);
 
   // Save template settings to localStorage when they change
   useEffect(() => {
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(templateSettings));
+    safeStorage.set(TEMPLATE_SETTINGS_STORAGE_KEY, JSON.stringify(templateSettings));
   }, [templateSettings]);
 
   // Warn user before leaving with unsaved changes
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (hasUnsavedChanges) {
+      if (hasUnsavedChanges || hasUnsavedCoverLetter || hasUnsavedOutreach) {
         e.preventDefault();
         e.returnValue = '';
       }
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [hasUnsavedChanges]);
+  }, [hasUnsavedChanges, hasUnsavedCoverLetter, hasUnsavedOutreach]);
 
   useEffect(() => {
+    // P0: without this, navigating from resume A to resume B before A's GET
+    // resolves lets A's response land under B's id — and because the response
+    // also flips loadingState to 'loaded', autosave then writes A's content
+    // into B. Every state write below is gated on the effect still being
+    // current. (The JD effect below already did this; this one did not.)
+    let cancelled = false;
+
     const loadResumeData = async () => {
+      if (cancelled) return;
       setLoadingState('loading');
+      setPendingDraftRestore(null);
+      setPendingAttachmentDraftRestore(null);
 
       // Priority 1: Fetch from API if ID is in URL (most reliable)
       if (resumeId) {
         try {
           const data = await fetchResume(resumeId);
+          if (cancelled) return;
+          // Prefer processed_resume if available
+          const status = data.raw_resume?.processing_status;
+          if (
+            status === 'processing' ||
+            status === 'failed' ||
+            (status === 'pending' && !isResumeDataShape(data.processed_resume))
+          ) {
+            setLoadingState('error');
+            return;
+          }
+          let serverData: ResumeData | null = null;
+          if (isResumeDataShape(data.processed_resume)) {
+            serverData = data.processed_resume;
+          } else if (data.raw_resume?.content) {
+            try {
+              const parsed: unknown = JSON.parse(data.raw_resume.content);
+              if (isResumeDataShape(parsed)) serverData = parsed;
+            } catch {
+              // Raw content may still be markdown instead of structured JSON.
+            }
+          }
+          if (!serverData) {
+            // Preserve drafts until a usable server baseline has been read.
+            setLoadingState('error');
+            return;
+          }
           // Track if this is a tailored resume (has parent_id)
           setIsTailoredResume(Boolean(data.parent_id));
           // Store resume title for downloads
           setResumeTitle(data.title ?? null);
-          // Load cover letter and outreach message if available
-          if (data.cover_letter) {
-            setCoverLetter(data.cover_letter);
+          // These values belong to this resume. Explicitly applying empty values
+          // prevents the preceding document's attachment from surviving a switch.
+          const serverCoverLetter = data.cover_letter ?? '';
+          const serverOutreachMessage = data.outreach_message ?? '';
+          setCoverLetter(serverCoverLetter);
+          setOutreachMessage(serverOutreachMessage);
+          attachmentValuesRef.current = {
+            coverLetter: serverCoverLetter,
+            outreachMessage: serverOutreachMessage,
+          };
+          attachmentBaselinesRef.current = attachmentValuesRef.current;
+          setHasUnsavedCoverLetter(false);
+          setHasUnsavedOutreach(false);
+          const attachmentDraft = readAttachmentDraft(resumeId);
+          if (
+            attachmentDraft &&
+            (attachmentDraft.coverLetter !== serverCoverLetter ||
+              attachmentDraft.outreachMessage !== serverOutreachMessage)
+          ) {
+            setPendingAttachmentDraftRestore(attachmentDraft);
+          } else {
+            clearAttachmentDraft(resumeId);
           }
-          if (data.outreach_message) {
-            setOutreachMessage(data.outreach_message);
+          setInterviewPrep(data.interview_prep ?? null);
+          setInterviewPrepError(null);
+          const localDraft = readStoredResumeDraft(resumeId);
+          setResumeData(serverData);
+          setLastSavedData(serverData);
+          setHasUnsavedChanges(false);
+          setHasCurrentLocalDraft(false);
+          syncedVersionRef.current = editVersionRef.current;
+          unsyncedSinceRef.current = null;
+          setAutoSaveError(null);
+          if (shouldPromptForDraftRestore(localDraft, serverData)) {
+            setPendingDraftRestore(localDraft);
+          } else {
+            clearStoredResumeDraft(resumeId);
           }
-          // Prefer processed_resume if available
-          if (data.processed_resume) {
-            setResumeData(data.processed_resume as ResumeData);
-            setLastSavedData(data.processed_resume as ResumeData);
-            setLoadingState('loaded');
-            return;
-          }
-          // Fallback to parsing raw content
-          if (data.raw_resume?.content) {
-            try {
-              const parsed = JSON.parse(data.raw_resume.content);
-              setResumeData(parsed);
-              setLastSavedData(parsed);
-              setLoadingState('loaded');
-              return;
-            } catch {
-              // Raw content is markdown, not JSON
-            }
-          }
+          setLoadingState('loaded');
+          return;
         } catch (err) {
+          if (cancelled) return;
+          // Do NOT fall through to the localStorage draft restore below. That
+          // path sets hasUnsavedChanges=true, which arms autosave and would
+          // PATCH a stale draft over a server copy we failed to read and
+          // therefore know nothing about. Surface the failure instead.
           console.error('Failed to load resume from API:', err);
+          setLoadingState('error');
+          return;
         }
       }
 
       // Priority 2: Improved Data from Context (Tailor Flow)
       if (improvedPreview) {
+        setIsTailoredResume(Boolean(improvedData?.data?.resume_id && improvedData.data.job_id));
         setResumeData(improvedPreview);
         setLastSavedData(improvedPreview);
-        // Also load cover letter and outreach if present
-        if (improvedCoverLetter) {
-          setCoverLetter(improvedCoverLetter);
-        }
-        if (improvedOutreach) {
-          setOutreachMessage(improvedOutreach);
-        }
+        const contextCoverLetter = improvedCoverLetter ?? '';
+        const contextOutreach = improvedOutreach ?? '';
+        setCoverLetter(contextCoverLetter);
+        setOutreachMessage(contextOutreach);
+        attachmentValuesRef.current = {
+          coverLetter: contextCoverLetter,
+          outreachMessage: contextOutreach,
+        };
+        attachmentBaselinesRef.current = attachmentValuesRef.current;
+        setHasUnsavedCoverLetter(false);
+        setHasUnsavedOutreach(false);
+        setInterviewPrep(improvedInterviewPrep);
+        setInterviewPrepError(null);
         // Persist to localStorage as backup
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(improvedPreview));
+        setHasCurrentLocalDraft(writeStoredResumeDraft(resumeId, improvedPreview));
         setLoadingState('loaded');
         return;
       }
 
       // Priority 3: Restore from localStorage (browser refresh recovery)
-      const savedDraft = localStorage.getItem(STORAGE_KEY);
+      const savedDraft = readStoredResumeDraft(resumeId);
       if (savedDraft) {
-        try {
-          const parsed = JSON.parse(savedDraft);
-          setResumeData(parsed);
-          setLastSavedData(parsed);
-          setHasUnsavedChanges(true); // Mark as unsaved since it's a draft
-          setLoadingState('loaded');
-          return;
-        } catch {
-          localStorage.removeItem(STORAGE_KEY);
-        }
+        setPendingDraftRestore(savedDraft);
+        setLoadingState('loaded');
+        return;
       }
 
       // Fallback: Use initial data
@@ -358,7 +547,26 @@ const ResumeBuilderContent = () => {
     };
 
     loadResumeData();
-  }, [improvedPreview, improvedCoverLetter, improvedOutreach, resumeId]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    improvedData?.data?.job_id,
+    improvedData?.data?.resume_id,
+    improvedPreview,
+    improvedCoverLetter,
+    improvedOutreach,
+    improvedInterviewPrep,
+    resumeId,
+  ]);
+
+  useEffect(() => {
+    // Scheduling navigation cannot acknowledge that the created resume opened.
+    // This identity-keyed builder retires recovery only after its validated
+    // server baseline is available; failed or abandoned loads retain it.
+    if (resumeId && loadingState === 'loaded') clearResumeWizardCompletion(resumeId);
+  }, [resumeId, loadingState]);
 
   // Fetch job description when we have a tailored resume
   useEffect(() => {
@@ -366,21 +574,26 @@ const ResumeBuilderContent = () => {
 
     const loadJobDescription = async () => {
       if (isTailoredResume && resumeId) {
+        setJobDescription(null);
+        setJobContextStatus('loading');
         try {
           const data = await fetchJobDescription(resumeId);
           if (!cancelled) {
             setJobDescription(data.content);
+            setJobContextStatus('available');
           }
         } catch (err) {
           // JD might not be available for older resumes
           if (!cancelled) {
             console.warn('Could not fetch job description:', err);
             setJobDescription(null);
+            setJobContextStatus('missing');
           }
         }
       } else {
         // Clear job description when switching to non-tailored resume
         setJobDescription(null);
+        setJobContextStatus('idle');
       }
     };
 
@@ -390,42 +603,321 @@ const ResumeBuilderContent = () => {
     };
   }, [isTailoredResume, resumeId]);
 
-  const handleUpdate = useCallback((newData: ResumeData) => {
-    setResumeData(newData);
-    setHasUnsavedChanges(true);
-    // Auto-save draft to localStorage
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(newData));
-  }, []);
+  const handleUpdate = useCallback(
+    (newData: ResumeData) => {
+      editVersionRef.current += 1;
+      unsyncedSinceRef.current ??= Date.now();
+      setResumeData(newData);
+      setHasUnsavedChanges(true);
+      setAutoSaveError(null);
+      // Auto-save draft to localStorage
+      setHasCurrentLocalDraft(writeStoredResumeDraft(resumeId, newData));
+    },
+    [resumeId]
+  );
 
   const handleSettingsChange = useCallback((newSettings: TemplateSettings) => {
     setTemplateSettings(newSettings);
   }, []);
+
+  const queueResumeSave = useCallback(
+    (editorData: ResumeData) => {
+      if (!resumeId) {
+        return Promise.reject(new Error('Resume ID is required to save.'));
+      }
+
+      const canonicalPayload = normalizeResumeForSave(editorData);
+      const runSave = resumeSaveQueueRef.current
+        .catch(() => {
+          // Keep the queue alive after a failed save so the next edit can still persist.
+        })
+        .then(() => {
+          if (!documentIsActiveRef.current) {
+            throw new DOMException('Editor closed', 'AbortError');
+          }
+          return updateResume(resumeId, canonicalPayload);
+        });
+
+      resumeSaveQueueRef.current = runSave.then(
+        () => undefined,
+        () => undefined
+      );
+
+      return runSave.then((response) => ({ response, canonicalPayload }));
+    },
+    [resumeId]
+  );
+
+  useEffect(() => {
+    if (
+      !resumeId ||
+      // Never PATCH before the server copy has been read. Until then resumeData
+      // still holds i18n placeholders, and a full-document replace would
+      // overwrite the real resume with them.
+      loadingState !== 'loaded' ||
+      !hasUnsavedChanges ||
+      isSaving ||
+      isAutoSaving ||
+      autoSaveError ||
+      regenerateWizard.step !== 'idle'
+    ) {
+      return;
+    }
+
+    const versionAtSchedule = editVersionRef.current;
+    const editorSnapshot = resumeData;
+    const elapsedSinceStreakStart = unsyncedSinceRef.current
+      ? Date.now() - unsyncedSinceRef.current
+      : 0;
+    const saveDelay = Math.max(
+      RESUME_AUTOSAVE_MIN_DELAY_MS,
+      Math.min(RESUME_AUTOSAVE_DEBOUNCE_MS, RESUME_AUTOSAVE_MAX_WAIT_MS - elapsedSinceStreakStart)
+    );
+    const timerId = window.setTimeout(async () => {
+      setIsAutoSaving(true);
+      // Restart the max-wait window on EVERY attempt, not only on attempts
+      // whose version check happens to match. Otherwise a single edit landing
+      // mid-flight leaves this marker set forever, the computed delay pins to
+      // its floor, and every subsequent keystroke schedules another PATCH.
+      unsyncedSinceRef.current = Date.now();
+      try {
+        const { response, canonicalPayload } = await queueResumeSave(editorSnapshot);
+        if (!documentIsActiveRef.current) return;
+        // Prefer the server's copy: it may rewrite the payload (e.g. aligning
+        // descriptionStyles), and comparing a stale client payload against the
+        // server state would surface a spurious draft-recovery prompt on reload.
+        setLastSavedData((response?.processed_resume as ResumeData) ?? canonicalPayload);
+        setLastAutoSavedAt(Date.now());
+        setAutoSaveError(null);
+
+        if (editVersionRef.current === versionAtSchedule) {
+          setHasUnsavedChanges(false);
+          syncedVersionRef.current = versionAtSchedule;
+          unsyncedSinceRef.current = null;
+          clearStoredResumeDraft(resumeId);
+          setHasCurrentLocalDraft(false);
+        }
+      } catch (error) {
+        if (!documentIsActiveRef.current) return;
+        console.error('Failed to auto-save resume:', error);
+        setAutoSaveError(t('builder.alerts.autoSaveFailed'));
+      } finally {
+        if (documentIsActiveRef.current) setIsAutoSaving(false);
+      }
+    }, saveDelay);
+
+    return () => window.clearTimeout(timerId);
+  }, [
+    autoSaveError,
+    hasUnsavedChanges,
+    isAutoSaving,
+    isSaving,
+    loadingState,
+    queueResumeSave,
+    regenerateWizard.step,
+    resumeData,
+    resumeId,
+    t,
+  ]);
+
+  const flushResumeChanges = useCallback(
+    async (showErrorDialog = true): Promise<boolean> => {
+      if (!resumeId || (!hasUnsavedChanges && !autoSaveError)) {
+        return true;
+      }
+
+      // Same guard as the autosave effect. Gating only autosave left the
+      // manual Save button able to issue the identical destructive
+      // full-document PATCH while the initial fetch was still in flight,
+      // replacing a real resume with i18n placeholders.
+      if (loadingState !== 'loaded') {
+        return false;
+      }
+
+      try {
+        setIsSaving(true);
+        const versionAtFlush = editVersionRef.current;
+        const editorSnapshot = resumeData;
+        const { response, canonicalPayload } = await queueResumeSave(editorSnapshot);
+        if (!documentIsActiveRef.current) return false;
+        setLastSavedData((response?.processed_resume as ResumeData) ?? canonicalPayload);
+        setAutoSaveError(null);
+
+        // Compare against syncedVersionRef, not a zeroed counter: an autosave
+        // completing ahead of this queued save used to reset the baseline and
+        // make a successful PATCH look like a failure to the caller.
+        syncedVersionRef.current = Math.max(syncedVersionRef.current, versionAtFlush);
+        if (editVersionRef.current === syncedVersionRef.current) {
+          setHasUnsavedChanges(false);
+          unsyncedSinceRef.current = null;
+          setLastAutoSavedAt(Date.now());
+          clearStoredResumeDraft(resumeId);
+          setHasCurrentLocalDraft(false);
+          return true;
+        }
+
+        return false;
+      } catch (error) {
+        if (!documentIsActiveRef.current) return false;
+        console.error('Failed to save resume:', error);
+        setAutoSaveError(t('builder.alerts.autoSaveFailed'));
+        if (showErrorDialog) {
+          showNotification(t('builder.alerts.saveFailed'), 'danger');
+        }
+        return false;
+      } finally {
+        if (documentIsActiveRef.current) setIsSaving(false);
+      }
+    },
+    [
+      autoSaveError,
+      hasUnsavedChanges,
+      loadingState,
+      queueResumeSave,
+      resumeData,
+      resumeId,
+      showNotification,
+      t,
+    ]
+  );
 
   const handleSave = async () => {
     if (!resumeId) {
       showNotification(t('builder.alerts.saveNotAvailable'), 'warning');
       return;
     }
-    try {
-      setIsSaving(true);
-      const updated = await updateResume(resumeId, resumeData);
-      const nextData = (updated.processed_resume || resumeData) as ResumeData;
-      setResumeData(nextData);
-      setLastSavedData(nextData);
-      setHasUnsavedChanges(false);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextData));
-    } catch (error) {
-      console.error('Failed to save resume:', error);
-      showNotification(t('builder.alerts.saveFailed'), 'danger');
-    } finally {
-      setIsSaving(false);
-    }
+    await flushResumeChanges(true);
   };
 
   const handleReset = () => {
+    const saveInFlight = isSaving || isAutoSaving;
     setResumeData(lastSavedData);
-    setHasUnsavedChanges(false);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(lastSavedData));
+
+    // Bump the version so any save already in flight cannot claim the reset
+    // state as synced when it lands — its captured baseline is now stale.
+    editVersionRef.current += 1;
+
+    if (saveInFlight) {
+      // That in-flight PATCH is carrying the edits we just discarded, so the
+      // server is about to hold content the editor no longer shows. Stay dirty
+      // and let autosave push the reset state, converging the two. Marking this
+      // clean is what left the discarded text on the server silently.
+      setHasUnsavedChanges(true);
+      unsyncedSinceRef.current = Date.now();
+      setHasCurrentLocalDraft(writeStoredResumeDraft(resumeId, lastSavedData));
+    } else {
+      setHasUnsavedChanges(false);
+      syncedVersionRef.current = editVersionRef.current;
+      unsyncedSinceRef.current = null;
+      clearStoredResumeDraft(resumeId);
+      setHasCurrentLocalDraft(false);
+    }
+
+    setAutoSaveError(null);
+  };
+
+  const handleRestoreLocalDraft = () => {
+    if (!pendingDraftRestore) return;
+    editVersionRef.current += 1;
+    unsyncedSinceRef.current = Date.now();
+    setResumeData(pendingDraftRestore.data);
+    setHasUnsavedChanges(true);
+    setAutoSaveError(null);
+    const didWriteScopedDraft = writeStoredResumeDraft(resumeId, pendingDraftRestore.data);
+    setHasCurrentLocalDraft(
+      didWriteScopedDraft ||
+        JSON.stringify(readStoredResumeDraft(resumeId)?.data) ===
+          JSON.stringify(pendingDraftRestore.data)
+    );
+    if (
+      didWriteScopedDraft &&
+      pendingDraftRestore.storageKey !== getResumeDraftStorageKey(resumeId)
+    ) {
+      clearResumeDraftStorageKey(pendingDraftRestore.storageKey);
+    }
+    setPendingDraftRestore(null);
+  };
+
+  const handleRestorePendingDrafts = () => {
+    handleRestoreLocalDraft();
+    handleRestoreAttachmentDraft();
+  };
+
+  const handleKeepServerDraft = () => {
+    if (pendingDraftRestore) {
+      clearResumeDraftStorageKey(pendingDraftRestore.storageKey);
+    } else {
+      clearStoredResumeDraft(resumeId);
+    }
+    setPendingDraftRestore(null);
+    setHasCurrentLocalDraft(false);
+    if (resumeId && pendingAttachmentDraftRestore) {
+      clearAttachmentDraft(resumeId);
+    }
+    setPendingAttachmentDraftRestore(null);
+    setHasCurrentAttachmentDraft(false);
+  };
+
+  const persistAttachmentDraft = (
+    values = attachmentValuesRef.current,
+    baselines = attachmentBaselinesRef.current
+  ) => {
+    if (!resumeId) return;
+    if (
+      values.coverLetter === baselines.coverLetter &&
+      values.outreachMessage === baselines.outreachMessage
+    ) {
+      clearAttachmentDraft(resumeId);
+      setHasCurrentAttachmentDraft(false);
+      return;
+    }
+    const didWrite = writeAttachmentDraft(resumeId, values.coverLetter, values.outreachMessage);
+    const existing = didWrite ? null : readAttachmentDraft(resumeId);
+    setHasCurrentAttachmentDraft(
+      didWrite ||
+        Boolean(
+          existing &&
+          existing.coverLetter === values.coverLetter &&
+          existing.outreachMessage === values.outreachMessage
+        )
+    );
+  };
+
+  const handleCoverLetterChange = (value: string) => {
+    coverLetterEditVersionRef.current += 1;
+    const values = { ...attachmentValuesRef.current, coverLetter: value };
+    attachmentValuesRef.current = values;
+    setCoverLetter(value);
+    setHasUnsavedCoverLetter(value !== attachmentBaselinesRef.current.coverLetter);
+    persistAttachmentDraft(values);
+  };
+
+  const handleOutreachChange = (value: string) => {
+    outreachEditVersionRef.current += 1;
+    const values = { ...attachmentValuesRef.current, outreachMessage: value };
+    attachmentValuesRef.current = values;
+    setOutreachMessage(value);
+    setHasUnsavedOutreach(value !== attachmentBaselinesRef.current.outreachMessage);
+    persistAttachmentDraft(values);
+  };
+
+  const handleRestoreAttachmentDraft = () => {
+    if (!pendingAttachmentDraftRestore) return;
+    const values = {
+      coverLetter: pendingAttachmentDraftRestore.coverLetter,
+      outreachMessage: pendingAttachmentDraftRestore.outreachMessage,
+    };
+    coverLetterEditVersionRef.current += 1;
+    outreachEditVersionRef.current += 1;
+    attachmentValuesRef.current = values;
+    setCoverLetter(values.coverLetter);
+    setOutreachMessage(values.outreachMessage);
+    setHasUnsavedCoverLetter(values.coverLetter !== attachmentBaselinesRef.current.coverLetter);
+    setHasUnsavedOutreach(
+      values.outreachMessage !== attachmentBaselinesRef.current.outreachMessage
+    );
+    persistAttachmentDraft(values);
+    setPendingAttachmentDraftRestore(null);
   };
 
   const getCompanyFromTitle = (title: string | null | undefined): string | null => {
@@ -434,9 +926,35 @@ const ResumeBuilderContent = () => {
     return atIdx !== -1 ? title.substring(atIdx + 3).trim() : null;
   };
 
+  const handleBackToDashboard = async () => {
+    const resumeDidSave = await flushResumeChanges(true);
+    const attachmentsDidSave = await flushAttachmentChanges();
+    if (resumeDidSave && attachmentsDidSave) {
+      router.push('/dashboard');
+    } else {
+      setShowLeaveWithLocalDraftDialog(true);
+    }
+  };
+
+  const handleLeaveWithLocalDraft = () => {
+    setShowLeaveWithLocalDraftDialog(false);
+    router.push('/dashboard');
+  };
+
+  const handleStartRegenerate = async () => {
+    const didSave = await flushResumeChanges(true);
+    if (didSave) {
+      regenerateWizard.startRegenerate();
+    }
+  };
+
   const handleDownload = async () => {
     if (!resumeId) {
       showNotification(t('builder.alerts.downloadNotAvailable'), 'warning');
+      return;
+    }
+    const didSave = await flushResumeChanges(true);
+    if (!didSave) {
       return;
     }
     try {
@@ -468,18 +986,98 @@ const ResumeBuilderContent = () => {
   };
 
   // Cover letter handlers
-  const handleSaveCoverLetter = async () => {
-    if (!resumeId) return;
+  const queueAttachmentWrite = <T,>(
+    queue: React.RefObject<Promise<void>>,
+    action: () => Promise<T>
+  ): Promise<T> => {
+    const operation = queue.current.then(() => {
+      if (!documentIsActiveRef.current) throw new DOMException('Editor closed', 'AbortError');
+      return action();
+    });
+    queue.current = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    return operation;
+  };
+
+  const handleSaveCoverLetter = async (
+    showSuccess = true,
+    showFailure = true
+  ): Promise<boolean> => {
+    if (!resumeId || loadingState !== 'loaded') return false;
+    const activeResumeId = resumeId;
     try {
+      coverLetterSaveCountRef.current += 1;
       setIsCoverLetterSaving(true);
-      await updateCoverLetter(resumeId, coverLetter);
-      showNotification(t('builder.alerts.coverLetterSaveSuccess'), 'success');
+      // A prior generation or newer edit can replace the value while this save waits.
+      const { savedContent, savedVersion } = await queueAttachmentWrite(
+        coverLetterSaveQueueRef,
+        async () => {
+          const savedContent = attachmentValuesRef.current.coverLetter;
+          const savedVersion = coverLetterEditVersionRef.current;
+          await updateCoverLetter(activeResumeId, savedContent);
+          return { savedContent, savedVersion };
+        }
+      );
+      if (!documentIsActiveRef.current) return false;
+      const baselines = { ...attachmentBaselinesRef.current, coverLetter: savedContent };
+      attachmentBaselinesRef.current = baselines;
+      const isStillCurrent =
+        savedVersion === coverLetterEditVersionRef.current &&
+        attachmentValuesRef.current.coverLetter === savedContent;
+      setHasUnsavedCoverLetter(!isStillCurrent);
+      persistAttachmentDraft(attachmentValuesRef.current, baselines);
+      if (showSuccess) {
+        showNotification(t('builder.alerts.coverLetterSaveSuccess'), 'success');
+      }
+      return true;
     } catch (error) {
+      if (!documentIsActiveRef.current) return false;
       console.error('Failed to save cover letter:', error);
-      showNotification(t('builder.alerts.coverLetterSaveFailed'), 'danger');
+      persistAttachmentDraft();
+      if (showFailure) {
+        showNotification(t('builder.alerts.coverLetterSaveFailed'), 'danger');
+      }
+      return false;
     } finally {
-      setIsCoverLetterSaving(false);
+      coverLetterSaveCountRef.current = Math.max(0, coverLetterSaveCountRef.current - 1);
+      if (documentIsActiveRef.current) {
+        setIsCoverLetterSaving(coverLetterSaveCountRef.current > 0);
+      }
     }
+  };
+
+  const flushCoverLetterForExport = async (showFailure = true): Promise<boolean> => {
+    while (documentIsActiveRef.current) {
+      await coverLetterSaveQueueRef.current;
+      if (!documentIsActiveRef.current) return false;
+      if (attachmentValuesRef.current.coverLetter === attachmentBaselinesRef.current.coverLetter) {
+        return true;
+      }
+      if (!(await handleSaveCoverLetter(false, showFailure))) {
+        return false;
+      }
+    }
+    return false;
+  };
+
+  const flushAttachmentChanges = async (): Promise<boolean> => {
+    while (documentIsActiveRef.current) {
+      if (!(await flushCoverLetterForExport(false))) return false;
+      await outreachSaveQueueRef.current;
+      if (!documentIsActiveRef.current) return false;
+      if (
+        attachmentValuesRef.current.outreachMessage !==
+        attachmentBaselinesRef.current.outreachMessage
+      ) {
+        if (!(await handleSaveOutreach(false, false))) return false;
+        continue;
+      }
+      if (attachmentValuesRef.current.coverLetter === attachmentBaselinesRef.current.coverLetter)
+        return true;
+    }
+    return false;
   };
 
   const handleDownloadCoverLetter = async () => {
@@ -493,6 +1091,9 @@ const ResumeBuilderContent = () => {
     }
     try {
       setIsDownloading(true);
+      if (!(await flushCoverLetterForExport())) {
+        return;
+      }
       const blob = await downloadCoverLetterPdf(resumeId, templateSettings.pageSize, uiLanguage);
       const company = getCompanyFromTitle(resumeTitle);
       const userName = resumeData.personalInfo?.name?.trim() || null;
@@ -519,19 +1120,46 @@ const ResumeBuilderContent = () => {
   };
 
   // Outreach handlers
-  const handleSaveOutreach = async () => {
-    if (!resumeId) return;
+  async function handleSaveOutreach(showSuccess = true, showFailure = true): Promise<boolean> {
+    if (!resumeId || loadingState !== 'loaded') return false;
+    const activeResumeId = resumeId;
     try {
+      outreachSaveCountRef.current += 1;
       setIsOutreachSaving(true);
-      await updateOutreachMessage(resumeId, outreachMessage);
-      showNotification(t('builder.alerts.outreachSaveSuccess'), 'success');
+      const { savedContent, savedVersion } = await queueAttachmentWrite(
+        outreachSaveQueueRef,
+        async () => {
+          const savedContent = attachmentValuesRef.current.outreachMessage;
+          const savedVersion = outreachEditVersionRef.current;
+          await updateOutreachMessage(activeResumeId, savedContent);
+          return { savedContent, savedVersion };
+        }
+      );
+      if (!documentIsActiveRef.current) return false;
+      const baselines = { ...attachmentBaselinesRef.current, outreachMessage: savedContent };
+      attachmentBaselinesRef.current = baselines;
+      const isStillCurrent =
+        savedVersion === outreachEditVersionRef.current &&
+        attachmentValuesRef.current.outreachMessage === savedContent;
+      setHasUnsavedOutreach(!isStillCurrent);
+      persistAttachmentDraft(attachmentValuesRef.current, baselines);
+      if (showSuccess) {
+        showNotification(t('builder.alerts.outreachSaveSuccess'), 'success');
+      }
+      return true;
     } catch (error) {
+      if (!documentIsActiveRef.current) return false;
       console.error('Failed to save outreach message:', error);
-      showNotification(t('builder.alerts.outreachSaveFailed'), 'danger');
+      persistAttachmentDraft();
+      if (showFailure) {
+        showNotification(t('builder.alerts.outreachSaveFailed'), 'danger');
+      }
+      return false;
     } finally {
-      setIsOutreachSaving(false);
+      outreachSaveCountRef.current = Math.max(0, outreachSaveCountRef.current - 1);
+      if (documentIsActiveRef.current) setIsOutreachSaving(outreachSaveCountRef.current > 0);
     }
-  };
+  }
 
   const handleCopyOutreach = async () => {
     try {
@@ -545,13 +1173,30 @@ const ResumeBuilderContent = () => {
 
   // On-demand generation handlers
   const doGenerateCoverLetter = async () => {
-    if (!resumeId) return;
+    if (!resumeId || loadingState !== 'loaded') return;
+    const activeResumeId = resumeId;
+    const startingEditVersion = coverLetterEditVersionRef.current;
     setIsGeneratingCoverLetter(true);
     setShowRegenerateDialog(null);
     try {
-      const content = await generateCoverLetter(resumeId);
-      setCoverLetter(content);
+      const content = await queueAttachmentWrite(coverLetterSaveQueueRef, () =>
+        generateCoverLetter(activeResumeId)
+      );
+      if (!documentIsActiveRef.current) return;
+      attachmentBaselinesRef.current = {
+        ...attachmentBaselinesRef.current,
+        coverLetter: content,
+      };
+      // Generation persisted this baseline, but subsequent user edits retain priority.
+      if (startingEditVersion === coverLetterEditVersionRef.current) {
+        coverLetterEditVersionRef.current += 1;
+        setCoverLetter(content);
+        attachmentValuesRef.current = { ...attachmentValuesRef.current, coverLetter: content };
+      }
+      setHasUnsavedCoverLetter(attachmentValuesRef.current.coverLetter !== content);
+      persistAttachmentDraft();
     } catch (error) {
+      if (!documentIsActiveRef.current) return;
       console.error('Failed to generate cover letter:', error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       showNotification(
@@ -559,12 +1204,12 @@ const ResumeBuilderContent = () => {
         'danger'
       );
     } finally {
-      setIsGeneratingCoverLetter(false);
+      if (documentIsActiveRef.current) setIsGeneratingCoverLetter(false);
     }
   };
 
   const handleGenerateCoverLetter = () => {
-    if (!resumeId) return;
+    if (!resumeId || loadingState !== 'loaded') return;
     // If content exists, show confirmation dialog
     if (coverLetter) {
       setShowRegenerateDialog('cover-letter');
@@ -574,13 +1219,29 @@ const ResumeBuilderContent = () => {
   };
 
   const doGenerateOutreach = async () => {
-    if (!resumeId) return;
+    if (!resumeId || loadingState !== 'loaded') return;
+    const activeResumeId = resumeId;
+    const startingEditVersion = outreachEditVersionRef.current;
     setIsGeneratingOutreach(true);
     setShowRegenerateDialog(null);
     try {
-      const content = await generateOutreachMessage(resumeId);
-      setOutreachMessage(content);
+      const content = await queueAttachmentWrite(outreachSaveQueueRef, () =>
+        generateOutreachMessage(activeResumeId)
+      );
+      if (!documentIsActiveRef.current) return;
+      attachmentBaselinesRef.current = {
+        ...attachmentBaselinesRef.current,
+        outreachMessage: content,
+      };
+      if (startingEditVersion === outreachEditVersionRef.current) {
+        outreachEditVersionRef.current += 1;
+        setOutreachMessage(content);
+        attachmentValuesRef.current = { ...attachmentValuesRef.current, outreachMessage: content };
+      }
+      setHasUnsavedOutreach(attachmentValuesRef.current.outreachMessage !== content);
+      persistAttachmentDraft();
     } catch (error) {
+      if (!documentIsActiveRef.current) return;
       console.error('Failed to generate outreach message:', error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       showNotification(
@@ -588,12 +1249,12 @@ const ResumeBuilderContent = () => {
         'danger'
       );
     } finally {
-      setIsGeneratingOutreach(false);
+      if (documentIsActiveRef.current) setIsGeneratingOutreach(false);
     }
   };
 
   const handleGenerateOutreach = () => {
-    if (!resumeId) return;
+    if (!resumeId || loadingState !== 'loaded') return;
     // If content exists, show confirmation dialog
     if (outreachMessage) {
       setShowRegenerateDialog('outreach');
@@ -601,6 +1262,107 @@ const ResumeBuilderContent = () => {
     }
     doGenerateOutreach();
   };
+
+  const canGenerateInterviewPrep =
+    Boolean(resumeId) &&
+    loadingState === 'loaded' &&
+    isTailoredResume &&
+    jobContextStatus === 'available';
+
+  const interviewPrepUnavailableMessage = !resumeId
+    ? t('interviewPrep.saveRequiredDescription')
+    : jobContextStatus === 'loading'
+      ? t('interviewPrep.loadingContextDescription')
+      : jobContextStatus === 'missing'
+        ? t('interviewPrep.missingContextDescription')
+        : null;
+
+  const doGenerateInterviewPrep = async () => {
+    if (!canGenerateInterviewPrep || !resumeId) return;
+    const activeResumeId = resumeId;
+    setIsGeneratingInterviewPrep(true);
+    setInterviewPrepError(null);
+    setShowRegenerateDialog(null);
+    try {
+      const content = await generateInterviewPrep(activeResumeId);
+      if (!documentIsActiveRef.current) return;
+      setInterviewPrep(content);
+    } catch (error) {
+      if (!documentIsActiveRef.current) return;
+      console.error('Failed to generate interview preparation:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      setInterviewPrepError(
+        t('builder.alerts.interviewPrepGenerateFailed', { error: errorMessage })
+      );
+      showNotification(
+        t('builder.alerts.interviewPrepGenerateFailed', { error: errorMessage }),
+        'danger'
+      );
+    } finally {
+      if (documentIsActiveRef.current) setIsGeneratingInterviewPrep(false);
+    }
+  };
+
+  const handleGenerateInterviewPrep = () => {
+    if (!canGenerateInterviewPrep) return;
+    if (interviewPrep) {
+      setShowRegenerateDialog('interview-prep');
+      return;
+    }
+    doGenerateInterviewPrep();
+  };
+
+  const regenerateDialogContentTitle =
+    showRegenerateDialog === 'cover-letter'
+      ? t('coverLetter.title')
+      : showRegenerateDialog === 'outreach'
+        ? t('outreach.title')
+        : t('interviewPrep.title');
+
+  const regenerateDialogConfirmLabel =
+    showRegenerateDialog === 'cover-letter'
+      ? t('coverLetter.regenerate')
+      : showRegenerateDialog === 'outreach'
+        ? t('outreach.regenerate')
+        : t('interviewPrep.regenerate');
+
+  const handleConfirmRegenerate = () => {
+    if (showRegenerateDialog === 'cover-letter') {
+      doGenerateCoverLetter();
+    } else if (showRegenerateDialog === 'outreach') {
+      doGenerateOutreach();
+    } else if (showRegenerateDialog === 'interview-prep') {
+      doGenerateInterviewPrep();
+    }
+  };
+
+  const resumeSaveStatus = (() => {
+    if (isSaving || isAutoSaving) {
+      return { label: t('builder.autoSave.saving'), tone: 'blue' as const };
+    }
+    if (autoSaveError) {
+      return { label: autoSaveError, tone: 'red' as const };
+    }
+    if (hasUnsavedChanges) {
+      return hasCurrentLocalDraft
+        ? { label: t('builder.autoSave.localDraft'), tone: 'amber' as const }
+        : { label: t('builder.autoSave.localDraftUnavailable'), tone: 'red' as const };
+    }
+    if (resumeId && lastAutoSavedAt) {
+      return { label: t('builder.autoSave.saved'), tone: 'green' as const };
+    }
+    return null;
+  })();
+
+  // Swiss tokens rather than raw Tailwind palette classes, matching the tone
+  // set used by StatCard in diff-preview-modal.tsx (L-09).
+  const resumeSaveStatusStyles = {
+    amber: 'border-warning bg-[#FFF7ED] text-warning',
+    blue: 'border-primary bg-[#EFF6FF] text-primary',
+    green: 'border-success bg-[#F0FDF4] text-success',
+    red: 'border-destructive bg-[#FEF2F2] text-destructive',
+  };
+  const ResumeSaveStatusIcon = resumeSaveStatus?.tone === 'green' ? Check : AlertTriangle;
 
   return (
     <div className="h-screen w-full bg-background flex justify-center items-center p-4 md:p-8">
@@ -611,11 +1373,7 @@ const ResumeBuilderContent = () => {
           {/* Top Row: Back button and Actions */}
           <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
             <div>
-              <Button
-                variant="link"
-                onClick={() => router.push('/dashboard')}
-                className="mb-2 -ml-1"
-              >
+              <Button variant="link" onClick={handleBackToDashboard} className="mb-2 -ml-1">
                 <ArrowLeft className="w-4 h-4" />
                 {t('nav.backToDashboard')}
               </Button>
@@ -627,10 +1385,12 @@ const ResumeBuilderContent = () => {
                   {'// '}
                   {resumeId ? t('builder.editMode') : t('builder.createAndPreview')}
                 </p>
-                {hasUnsavedChanges && (
-                  <span className="flex items-center gap-1 text-xs font-mono text-amber-600 bg-amber-50 px-2 py-1 border border-amber-200">
-                    <AlertTriangle className="w-3 h-3" />
-                    {t('builder.unsavedDraft')}
+                {resumeSaveStatus && (
+                  <span
+                    className={`flex items-center gap-1 text-xs font-mono px-2 py-1 border ${resumeSaveStatusStyles[resumeSaveStatus.tone]}`}
+                  >
+                    <ResumeSaveStatusIcon className="w-3 h-3" />
+                    {resumeSaveStatus.label}
                   </span>
                 )}
               </div>
@@ -643,8 +1403,8 @@ const ResumeBuilderContent = () => {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => regenerateWizard.startRegenerate()}
-                    disabled={!resumeId}
+                    onClick={handleStartRegenerate}
+                    disabled={!resumeId || isSaving}
                   >
                     <Sparkles className="w-4 h-4" />
                     {t('builder.regenerate.buttonLabel')}
@@ -658,9 +1418,19 @@ const ResumeBuilderContent = () => {
                     <RotateCcw className="w-4 h-4" />
                     {t('common.reset')}
                   </Button>
-                  <Button size="sm" onClick={handleSave} disabled={!resumeId || isSaving}>
+                  <Button
+                    size="sm"
+                    onClick={handleSave}
+                    disabled={!resumeId || isSaving || loadingState !== 'loaded'}
+                  >
                     <Save className="w-4 h-4" />
-                    {isSaving ? t('common.saving') : t('common.save')}
+                    {isSaving
+                      ? t('common.saving')
+                      : autoSaveError
+                        ? t('builder.autoSave.retrySave')
+                        : hasUnsavedChanges
+                          ? t('builder.autoSave.saveNow')
+                          : t('builder.autoSave.savedButton')}
                   </Button>
                   <Button
                     variant="success"
@@ -733,6 +1503,23 @@ const ResumeBuilderContent = () => {
                   </Button>
                 </>
               )}
+
+              {/* Interview prep tab actions */}
+              {activeTab === 'interview-prep' && interviewPrep && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleGenerateInterviewPrep}
+                  disabled={!canGenerateInterviewPrep || isGeneratingInterviewPrep}
+                >
+                  {isGeneratingInterviewPrep ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-4 h-4" />
+                  )}
+                  {t('interviewPrep.regenerate')}
+                </Button>
+              )}
             </div>
           </div>
         </div>
@@ -748,24 +1535,36 @@ const ResumeBuilderContent = () => {
                   {activeTab === 'resume' && t('builder.leftPanel.editorPanel')}
                   {activeTab === 'cover-letter' && t('builder.leftPanel.coverLetterEditor')}
                   {activeTab === 'outreach' && t('builder.leftPanel.outreachEditor')}
+                  {activeTab === 'interview-prep' && t('builder.leftPanel.interviewPrep')}
                   {activeTab === 'jd-match' && t('builder.leftPanel.jdMatchAnalysis')}
                 </h2>
               </div>
 
               {/* Resume Editor */}
-              {activeTab === 'resume' && (
-                <>
-                  <FormattingControls settings={templateSettings} onChange={handleSettingsChange} />
-                  <ResumeForm resumeData={resumeData} onUpdate={handleUpdate} />
-                </>
-              )}
+              {activeTab === 'resume' &&
+                (loadingState === 'error' ? (
+                  <div
+                    role="alert"
+                    className="border border-destructive bg-[#FEF2F2] p-4 font-mono text-xs text-destructive"
+                  >
+                    {t('builder.alerts.loadFailed')}
+                  </div>
+                ) : (
+                  <>
+                    <FormattingControls
+                      settings={templateSettings}
+                      onChange={handleSettingsChange}
+                    />
+                    <ResumeForm resumeData={resumeData} onUpdate={handleUpdate} />
+                  </>
+                ))}
 
               {/* Cover Letter Editor */}
               {activeTab === 'cover-letter' &&
                 (coverLetter ? (
                   <CoverLetterEditor
                     content={coverLetter}
-                    onChange={setCoverLetter}
+                    onChange={handleCoverLetterChange}
                     onSave={handleSaveCoverLetter}
                     isSaving={isCoverLetterSaving}
                   />
@@ -783,7 +1582,7 @@ const ResumeBuilderContent = () => {
                 (outreachMessage ? (
                   <OutreachEditor
                     content={outreachMessage}
-                    onChange={setOutreachMessage}
+                    onChange={handleOutreachChange}
                     onSave={handleSaveOutreach}
                     isSaving={isOutreachSaving}
                   />
@@ -795,6 +1594,20 @@ const ResumeBuilderContent = () => {
                     isTailoredResume={isTailoredResume}
                   />
                 ))}
+
+              {/* Interview Prep Read-Only View */}
+              {activeTab === 'interview-prep' && (
+                <InterviewPrepView
+                  interviewPrep={interviewPrep}
+                  isGenerating={isGeneratingInterviewPrep}
+                  error={interviewPrepError}
+                  onGenerate={handleGenerateInterviewPrep}
+                  isTailoredResume={isTailoredResume}
+                  canGenerate={canGenerateInterviewPrep}
+                  unavailableMessage={interviewPrepUnavailableMessage}
+                  className="p-0"
+                />
+              )}
 
               {/* JD Match Info Panel */}
               {activeTab === 'jd-match' && (
@@ -865,6 +1678,11 @@ const ResumeBuilderContent = () => {
                     disabled: !outreachMessage,
                   },
                   {
+                    id: 'interview-prep',
+                    label: t('builder.previewTabs.interviewPrep'),
+                    disabled: !isTailoredResume,
+                  },
+                  {
                     id: 'jd-match',
                     label: t('builder.previewTabs.jdMatch'),
                     disabled: !jobDescription,
@@ -919,6 +1737,19 @@ const ResumeBuilderContent = () => {
                   />
                 ))}
 
+              {/* Interview Prep Preview */}
+              {activeTab === 'interview-prep' && (
+                <InterviewPrepView
+                  interviewPrep={interviewPrep}
+                  isGenerating={isGeneratingInterviewPrep}
+                  error={interviewPrepError}
+                  onGenerate={handleGenerateInterviewPrep}
+                  isTailoredResume={isTailoredResume}
+                  canGenerate={canGenerateInterviewPrep}
+                  unavailableMessage={interviewPrepUnavailableMessage}
+                />
+              )}
+
               {/* JD Match Comparison */}
               {activeTab === 'jd-match' && jobDescription && (
                 <JDComparisonView jobDescription={jobDescription} resumeData={resumeData} />
@@ -964,23 +1795,59 @@ const ResumeBuilderContent = () => {
         open={showRegenerateDialog !== null}
         onOpenChange={(open) => !open && setShowRegenerateDialog(null)}
         title={t('builder.regenerateDialog.title', {
-          title:
-            showRegenerateDialog === 'cover-letter' ? t('coverLetter.title') : t('outreach.title'),
+          title: regenerateDialogContentTitle,
         })}
         description={t('builder.regenerateDialog.description', {
-          title:
-            showRegenerateDialog === 'cover-letter' ? t('coverLetter.title') : t('outreach.title'),
+          title: regenerateDialogContentTitle,
         })}
-        confirmLabel={
-          showRegenerateDialog === 'cover-letter'
-            ? t('coverLetter.regenerate')
-            : t('outreach.regenerate')
-        }
+        confirmLabel={regenerateDialogConfirmLabel}
         cancelLabel={t('common.cancel')}
         variant="warning"
-        onConfirm={
-          showRegenerateDialog === 'cover-letter' ? doGenerateCoverLetter : doGenerateOutreach
-        }
+        onConfirm={handleConfirmRegenerate}
+      />
+
+      {/* Local Draft Recovery Dialog */}
+      <ConfirmDialog
+        open={pendingDraftRestore !== null || pendingAttachmentDraftRestore !== null}
+        onOpenChange={() => undefined}
+        title={t('builder.draftRecovery.title')}
+        description={t(
+          resumeId ? 'builder.draftRecovery.description' : 'builder.draftRecovery.newDescription'
+        )}
+        confirmLabel={t('builder.draftRecovery.restoreDraft')}
+        cancelLabel={t(resumeId ? 'builder.draftRecovery.useServer' : 'builder.discardChanges')}
+        variant="warning"
+        closeOnConfirm={false}
+        onConfirm={handleRestorePendingDrafts}
+        onCancel={handleKeepServerDraft}
+      />
+
+      {/* Leave With Local Draft Dialog */}
+      <ConfirmDialog
+        open={showLeaveWithLocalDraftDialog}
+        onOpenChange={setShowLeaveWithLocalDraftDialog}
+        title={t(
+          hasCurrentRecoveryDraft
+            ? 'builder.leaveWithLocalDraft.title'
+            : 'builder.leaveWithoutDraft.title'
+        )}
+        description={t(
+          hasCurrentRecoveryDraft
+            ? 'builder.leaveWithLocalDraft.description'
+            : 'builder.leaveWithoutDraft.description'
+        )}
+        confirmLabel={t(
+          hasCurrentRecoveryDraft
+            ? 'builder.leaveWithLocalDraft.leave'
+            : 'builder.leaveWithoutDraft.leave'
+        )}
+        cancelLabel={t(
+          hasCurrentRecoveryDraft
+            ? 'builder.leaveWithLocalDraft.stay'
+            : 'builder.leaveWithoutDraft.stay'
+        )}
+        variant="warning"
+        onConfirm={handleLeaveWithLocalDraft}
       />
 
       {/* Notification Dialog (replaces native alert()) */}
@@ -1010,6 +1877,7 @@ const ResumeBuilderContent = () => {
         regenerateErrors={regenerateWizard.regenerateErrors}
         isGenerating={regenerateWizard.isGenerating}
         isApplying={regenerateWizard.isApplying}
+        needsRefresh={regenerateWizard.needsRefresh}
         error={regenerateWizard.error}
         onGenerate={regenerateWizard.generate}
         onAccept={regenerateWizard.acceptChanges}
@@ -1020,11 +1888,18 @@ const ResumeBuilderContent = () => {
   );
 };
 
+const ResumeBuilderDocument = () => {
+  const searchParams = useSearchParams();
+  // Query-only navigation can retain this page. Remount the editor at the
+  // document boundary so every baseline, queue and draft belongs to one ID.
+  return <ResumeBuilderContent key={searchParams.get('id') ?? 'new'} />;
+};
+
 export const ResumeBuilder = () => {
   const { t } = useTranslations();
   return (
     <Suspense fallback={<div>{t('common.loading')}</div>}>
-      <ResumeBuilderContent />
+      <ResumeBuilderDocument />
     </Suspense>
   );
 };
