@@ -41,6 +41,12 @@ class ControlledPage:
         if self.gate is not None:
             await self.gate.wait()
 
+    async def route(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    async def route_web_socket(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
     async def goto(self, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
         await self._stage()
@@ -180,6 +186,49 @@ async def test_playwright_stage_timeout_has_explicit_timeout_outcome(
 
     assert browser.new_page_calls == 1
     assert page.closed.is_set()
+
+
+async def test_readiness_timeout_points_at_the_frontend_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page that loads but never shows the resume is a wrong URL, not a big resume."""
+
+    class NeverReadyPage(ControlledPage):
+        async def wait_for_selector(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            await asyncio.Event().wait()
+
+    page = NeverReadyPage()
+    monkeypatch.setattr(pdf_module, "_browser", ControlledBrowser(lambda: page))
+
+    with pytest.raises(pdf_module.PDFRenderTimeoutError) as exc_info:
+        await pdf_module.render_resume_pdf("data:text/html,other-app")
+
+    assert "FRONTEND_BASE_URL" in str(exc_info.value)
+    assert "simpler resume" not in str(exc_info.value)
+    assert page.closed.is_set()
+
+
+async def test_timeout_log_hides_the_draft_token(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A page-fit draft token in the print URL can fetch unsaved resume data."""
+
+    class NeverReadyPage(ControlledPage):
+        async def wait_for_selector(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(pdf_module, "_browser", ControlledBrowser(NeverReadyPage))
+
+    with caplog.at_level(logging.WARNING, logger="app.pdf"):
+        with pytest.raises(pdf_module.PDFRenderTimeoutError):
+            await pdf_module.render_resume_pdf(
+                "http://127.0.0.1:3000/print/resumes/1?draft=0123abcd"
+            )
+
+    assert any("draft=<redacted>" in r.getMessage() for r in caplog.records)
+    assert not any("0123abcd" in r.getMessage() for r in caplog.records)
 
 
 async def test_zero_queue_admission_rejects_fifth_render(
@@ -438,6 +487,59 @@ async def test_detached_worker_failure_is_logged_server_side(
     assert pdf_module._active_renders == 0
 
 
+async def test_cancelled_slot_owner_keeps_slot_until_worker_exits() -> None:
+    """Cancelling the owner propagates, but the slot stays reserved until the worker exits."""
+    finish = asyncio.Event()
+
+    async def worker_body() -> bytes:
+        await finish.wait()
+        return b"%PDF-1.4"
+
+    pdf_module._active_renders = 1
+    worker = asyncio.create_task(worker_body())
+    owner = asyncio.create_task(pdf_module._release_slot_after_worker(worker))
+    await asyncio.sleep(0)
+    owner.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    # The worker (a to_thread render in production) keeps running and owns the slot.
+    assert not worker.done()
+    assert pdf_module._active_renders == 1
+
+    finish.set()
+    await worker
+    await asyncio.sleep(0)
+    assert pdf_module._active_renders == 0
+
+
+async def test_failed_worker_after_owner_cancel_is_logged_and_released(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A worker that fails after its owner was cancelled still frees the slot and logs."""
+    finish = asyncio.Event()
+
+    async def worker_body() -> bytes:
+        await finish.wait()
+        raise RuntimeError("synthetic late worker failure")
+
+    pdf_module._active_renders = 1
+    worker = asyncio.create_task(worker_body())
+    owner = asyncio.create_task(pdf_module._release_slot_after_worker(worker))
+    await asyncio.sleep(0)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    with caplog.at_level(logging.ERROR, logger="app.pdf"):
+        finish.set()
+        await asyncio.wait({worker})
+        await asyncio.sleep(0)
+
+    assert "synthetic late worker failure" in caplog.text
+    assert pdf_module._active_renders == 0
+
+
 async def test_non_timeout_page_close_failure_retires_browser(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -618,3 +720,24 @@ async def test_thread_fallback_inherits_remaining_deadline(
     monkeypatch.setattr(pdf_module, "_render_resume_pdf_sync", worker)
     assert await pdf_module.render_resume_pdf("data:text/html,fallback") == b"%PDF"
     assert deadlines[0] - started < 0.35
+
+
+async def test_thread_fallback_keeps_the_readiness_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The threaded fallback (Windows) must not re-tag the worker's readiness timeout."""
+
+    async def unsupported(*args: Any) -> bytes:
+        raise NotImplementedError
+
+    def worker(*args: Any) -> bytes:
+        raise pdf_module._PDFDeadlineExceeded("resume readiness")
+
+    monkeypatch.setattr(pdf_module, "_render_on_shared_browser", unsupported)
+    monkeypatch.setattr(pdf_module, "_render_resume_pdf_sync", worker)
+
+    with pytest.raises(pdf_module.PDFRenderTimeoutError) as exc_info:
+        await pdf_module.render_resume_pdf("data:text/html,other-app")
+
+    assert "FRONTEND_BASE_URL" in str(exc_info.value)
+    assert "simpler resume" not in str(exc_info.value)

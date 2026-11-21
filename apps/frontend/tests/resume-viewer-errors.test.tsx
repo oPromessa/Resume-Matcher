@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import ResumeViewerPage from '@/app/(default)/resumes/[id]/page';
+import { Toaster, toast } from '@/components/ui/toaster';
 import {
   deleteResume,
   downloadResumePdf,
@@ -29,6 +30,7 @@ vi.mock('@/lib/context/language-context', () => ({
 }));
 vi.mock('@/components/enrichment/enrichment-modal', () => ({ EnrichmentModal: () => null }));
 vi.mock('@/components/dashboard/resume-component', () => ({ default: () => null }));
+vi.mock('@/components/preview', () => ({ PaginatedPreview: () => null }));
 vi.mock('@/lib/api/resume', () => ({
   fetchResume: vi.fn(),
   deleteResume: vi.fn(),
@@ -70,7 +72,12 @@ describe('resume viewer operation errors', () => {
   ])('shows a retryable download error for %s', async (failure) => {
     mockedDownload.mockRejectedValue(failure);
     vi.mocked(openUrlInNewTab).mockReturnValue(false);
-    render(<ResumeViewerPage />);
+    render(
+      <>
+        <ResumeViewerPage />
+        <Toaster />
+      </>
+    );
 
     const downloadButton = await screen.findByRole('button', {
       name: 'resumeViewer.downloadResume',
@@ -88,14 +95,18 @@ describe('resume viewer operation errors', () => {
     mockedDownload.mockResolvedValue(new Blob(['pdf']));
     await act(async () => screen.getByRole('button', { name: 'common.retry' }).click());
     expect(mockedDownload).toHaveBeenCalledTimes(2);
-    expect(await screen.findByText('common.success')).toBeInTheDocument();
-    expect(screen.queryByText('resumeViewer.downloadFailedTitle')).not.toBeInTheDocument();
+    // #1091: success is a toast, not a dialog the user has to dismiss.
+    expect(await screen.findByText('builder.alerts.downloadSuccess')).toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByText('common.success')).not.toBeInTheDocument();
+    act(() => toast.dismiss());
   });
 
   it('retains the edited title and offers retry after rename failure', async () => {
     mockedRename.mockRejectedValueOnce(new Error('rename failed')).mockResolvedValue(undefined);
     render(<ResumeViewerPage />);
-    fireEvent.click(await screen.findByRole('button', { name: 'Original title' }));
+    await screen.findByRole('heading', { level: 1, name: 'Original title' });
+    fireEvent.click(screen.getByRole('button', { name: 'resumeViewer.renameTitle' }));
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Edited title' } });
     await act(async () => fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' }));
 
@@ -103,7 +114,9 @@ describe('resume viewer operation errors', () => {
     expect(mockedRename).toHaveBeenCalledTimes(1);
     expect(screen.getByText('resumeViewer.renameFailedTitle')).toBeInTheDocument();
     await act(async () => screen.getByRole('button', { name: 'common.retry' }).click());
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Edited title' })).toBeVisible());
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { level: 1, name: 'Edited title' })).toBeVisible()
+    );
   });
 
   it('keeps the resume and retries deletion after failure', async () => {
@@ -161,9 +174,9 @@ it('keeps the current resume visible when an old retry settles after identity ch
   fireEvent.click(await screen.findByRole('button', { name: 'resumeViewer.retryProcessing' }));
   route.resumeId = 'resume-b';
   view.rerender(<ResumeViewerPage />);
-  await screen.findByRole('button', { name: 'Original title' });
+  await screen.findByRole('heading', { level: 1, name: 'Original title' });
   await act(async () => settle({ resume_id: 'resume-123', processing_status: 'processing' }));
-  expect(screen.getByRole('button', { name: 'Original title' })).toBeVisible();
+  expect(screen.getByRole('heading', { level: 1, name: 'Original title' })).toBeVisible();
   expect(screen.queryByText('resumeViewer.errors.stillProcessing')).not.toBeInTheDocument();
 });
 
@@ -176,7 +189,8 @@ it('keeps the current resume title when an old rename settles after identity cha
       })
   );
   const view = render(<ResumeViewerPage />);
-  fireEvent.click(await screen.findByRole('button', { name: 'Original title' }));
+  await screen.findByRole('heading', { level: 1, name: 'Original title' });
+  fireEvent.click(screen.getByRole('button', { name: 'resumeViewer.renameTitle' }));
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Old A renamed' } });
   fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
   mockedFetch.mockResolvedValueOnce({
@@ -186,9 +200,9 @@ it('keeps the current resume title when an old rename settles after identity cha
   } as Awaited<ReturnType<typeof fetchResume>>);
   route.resumeId = 'resume-b';
   view.rerender(<ResumeViewerPage />);
-  await screen.findByRole('button', { name: 'New B title' });
+  await screen.findByRole('heading', { level: 1, name: 'New B title' });
   await act(async () => settle());
-  expect(screen.getByRole('button', { name: 'New B title' })).toBeVisible();
+  expect(screen.getByRole('heading', { level: 1, name: 'New B title' })).toBeVisible();
   expect(mockedRename).toHaveBeenCalledWith('resume-123', 'Old A renamed');
 });
 

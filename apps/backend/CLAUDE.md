@@ -3,7 +3,7 @@
 > FastAPI backend for Resume Matcher. This file goes **deeper on the backend**.
 > For project-wide context see the root [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) and [`docs/agent/README.md`](../../docs/agent/README.md).
 
-Stack: FastAPI 0.128 · Python **3.13+** · Pydantic v2 / pydantic-settings · SQLAlchemy 2 (async) + SQLite (`aiosqlite`) · LiteLLM (multi-provider AI) · markitdown (DOCX/PDF→Markdown) · Playwright/Chromium (PDF). Managed with **uv** (`pyproject.toml`, version `1.3.0`).
+Stack: FastAPI 0.162 · Python **3.14+** · Pydantic v2 / pydantic-settings · SQLAlchemy 2 (async) + SQLite (`aiosqlite`) · LiteLLM (multi-provider AI) · markitdown (DOCX/PDF→Markdown) · Playwright/Chromium (PDF). Managed with **uv** (`pyproject.toml`, version `1.4.0`).
 
 ---
 
@@ -12,10 +12,10 @@ Stack: FastAPI 0.128 · Python **3.13+** · Pydantic v2 / pydantic-settings · S
 | Module | Responsibility | Key files |
 |--------|----------------|-----------|
 | Entry / wiring | App, lifespan, CORS, router mounting (all under `/api/v1`) | `app/main.py` |
-| Settings | Env vars via `pydantic-settings`; `settings` singleton; API keys read from the encrypted SQLite store | `app/config.py` |
+| Settings | Env vars via `pydantic-settings`; `settings` singleton; API keys read from the encrypted `api_keys` table of the selected database (SQLite or PostgreSQL) | `app/config.py` |
 | Crypto | Fernet encrypt/decrypt for API keys at rest (`data/.secret_key`, `chmod 600`, gitignored) | `app/crypto.py` |
 | Config cache | Shared, TTL-cached (5 min) read of `data/config.json`; `get_content_language()` | `app/config_cache.py` |
-| Database | Async SQLAlchemy/SQLite facade; tables `resumes`/`jobs`/`improvements`/`applications`/`api_keys`; returns plain dicts; global `db` singleton | `app/database.py`, `app/models.py`, `app/db_engine.py` |
+| Database | Async SQLAlchemy facade (SQLite default, PostgreSQL via `DATABASE_URL`); tables `resumes`/`jobs`/`improvements`/`applications`/`api_keys`; returns plain dicts; global `db` singleton | `app/database.py`, `app/models.py`, `app/db_engine.py`, `app/db_url.py` · [postgres-backend.md](../../docs/agent/features/postgres-backend.md) |
 | Tracker | Kanban application-tracker endpoints | `app/routers/applications.py`, `app/schemas/applications.py` |
 | LLM | LiteLLM wrapper: Router, retries, JSON extraction, timeouts, provider quirks | `app/llm.py` |
 | PDF | Headless Chromium render of frontend `/print/*` pages; lazy browser init | `app/pdf.py` |
@@ -23,6 +23,8 @@ Stack: FastAPI 0.128 · Python **3.13+** · Pydantic v2 / pydantic-settings · S
 | Services | Business logic (parse, improve/diff, refine, cover-letter) | `app/services/*.py` |
 | Prompts | All LLM prompt templates + placeholder validation | `app/prompts/*.py` |
 | Schemas | Pydantic request/response + `ResumeData` models | `app/schemas/*.py` |
+| MCP server | stdio MCP tools; the agent is the LLM, no LLM calls here | `app/mcp_server/*.py` · [mcp-server.md](../../docs/agent/features/mcp-server.md) |
+| ATS parse-check | Deterministic parseability checks + round trip (no LLM) | `app/services/ats_parse/`, `app/routers/ats.py` · [ats-parse-check.md](../../docs/agent/features/ats-parse-check.md) |
 
 `data/` holds `resume_matcher.db` (SQLite; primary store), `config.json` (non-secret config), `.secret_key` (Fernet secret for encrypted API keys), an `uploads/` dir, and possibly a legacy `database.json` (TinyDB — imported into SQLite on first startup, then renamed `database.json.migrated`). `.gitignore` ignores `*.db*`, `data/*.json`, and `data/.secret_key` (DB + config + secret never get committed), but **`uploads/` is NOT git-ignored** — don't commit user uploads. `db.reset_database()` truncates the document tables + `applications` (preserving `api_keys`) and wipes `uploads/`.
 
@@ -31,12 +33,17 @@ Stack: FastAPI 0.128 · Python **3.13+** · Pydantic v2 / pydantic-settings · S
 - `config.py` — `/config/llm-api-key` (GET/PUT), `/config/llm-test` (POST live health check), `/config/features`, `/config/language`, `/config/prompts`, `/config/feature-prompts`, `/config/api-keys` (per-provider CRUD), `/config/reset` (POST; confirmation token `{"confirm": "RESET_ALL_DATA"}` in the JSON **body**, not a query param).
 - `resumes.py` — the biggest router: `/resumes/upload`, `GET /resumes`, `/resumes/list`, `/resumes/improve` + `/improve/preview` + `/improve/confirm`, `PATCH /resumes/{id}`, `/{id}/pdf`, `/{id}/retry-processing`, cover-letter/outreach/title PATCH + on-demand generate, `/{id}/job-description`, `/{id}/cover-letter/pdf`.
 - `jobs.py` — `/jobs/upload` (batch JD text → job_ids), `GET /jobs/{id}`.
+- `applications.py` — tracker card CRUD (`/applications`, `/applications/{id}`, `/bulk`, `/bulk-delete`) on the plain router, plus `POST /applications/{id}/follow-up` on `ai_router` (`AIOperationRoute`: 504 on timeout, 422 on oversized input). It drafts a follow-up email from the card's job, resume, company, role and days since applying, and saves nothing.
+- `ats.py` — `POST /ats/parse-check` (upload), `POST /resumes/{id}/parse-check` (own render + round trip).
 - `enrichment.py` — `/enrichment/analyze/{id}`, `/enhance`, `/apply/{id}`, `/regenerate`, `/apply-regenerated/{id}`.
+- `writing.py` — `POST /writing/check` (code-rule writing score, no LLM), `POST /writing/improve` (critique-and-rewrite on unsaved Builder data; saves nothing). `resumes.py` also has `GET /resumes/improve/progress/{id}` (SSE stages of a run started with that `progress_id`) and `POST /resumes/improve/apply-keywords` (forces chosen job keywords into a preview; returns a new preview).
 
 ### Services
 - `parser.py` — `parse_document` (markitdown bytes→Markdown), `parse_resume_to_json` (LLM→`ResumeData`), `restore_dates_from_markdown` (re-inserts months the LLM drops).
 - `improver.py` (largest) — keyword extraction, **diff-based** improvement (`generate_resume_diffs` → `apply_diffs` with path allow/block-lists → `verify_diff_result`), skill-target planning (`generate_skill_target_plan`/`verify_skill_target_plan`), legacy full-output `improve_resume`, `calculate_resume_diff`. Sanitizes prompt-injection patterns in user input.
 - `refiner.py` — multi-pass polish: keyword injection (LLM), AI-phrase removal (local, via `refinement.py` blacklist), master-alignment validation. Driven by `RefinementConfig`.
+- `writing_quality.py` (code rules, score, `fact_violations` rewrite check), `writing_loop.py` (critic + one rewrite of hard findings, run after `refine_resume` in every tailoring; Light nudge only critiques), `keyword_forcing.py` (apply-keywords placement + verification), `progress.py` (stage registry behind the SSE endpoint).
+- `text_match.py` — `keyword_in_text` (whole-term match; CJK-aware, since CJK text has no spaces) and `normalize_skill_key`. The one matcher for ATS scoring, tailoring, refinement and writing checks; don't add a local `\b`/`(?<!\w)` copy.
 - `cover_letter.py` — `generate_cover_letter`, `generate_outreach_message`, `generate_resume_title`; resolves custom-vs-default feature prompts at runtime.
 
 ---
@@ -61,14 +68,19 @@ Prompts are **plain Python string constants** — no Jinja, no external prompt f
 
 | File | Holds |
 |------|-------|
-| `app/prompts/templates.py` | Resume parse, keyword extraction, the 3 improve variants, diff prompt, skill-target plan, cover-letter / outreach / title, `RESUME_SCHEMA_EXAMPLE`, `CRITICAL_TRUTHFULNESS_RULES`, `LANGUAGE_NAMES` + `get_language_name()` |
+| `app/prompts/templates.py` | Resume parse, keyword extraction, the 4 improve variants, diff prompt, skill-target plan, cover-letter / outreach / follow-up email / title, `RESUME_SCHEMA_EXAMPLE`, `CRITICAL_TRUTHFULNESS_RULES`, `LANGUAGE_NAMES` + `get_language_name()` |
 | `app/prompts/enrichment.py` | `ANALYZE_RESUME_PROMPT`, `ENHANCE_DESCRIPTION_PROMPT`, `REGENERATE_ITEM_PROMPT`, `REGENERATE_SKILLS_PROMPT` |
-| `app/prompts/refinement.py` | `KEYWORD_INJECTION_PROMPT`, `VALIDATION_POLISH_PROMPT`, `AI_PHRASE_BLACKLIST`, `AI_PHRASE_REPLACEMENTS` |
+| `app/prompts/refinement.py` | `KEYWORD_INJECTION_PROMPT`, `AI_PHRASE_BLACKLIST`, `AI_PHRASE_REPLACEMENTS` |
+| `app/prompts/writing.py` | `WRITING_RUBRIC` (copied verbatim into the resume-matcher SKILL.md; a test keeps them equal), `WRITING_CRITIQUE_PROMPT`, `WRITING_REWRITE_PROMPT`, `KEYWORD_PLACEMENT_PROMPT`, `FORCED_KEYWORDS_PREP_NOTE` |
 | `app/prompts/__init__.py` | Re-exports template constants; placeholder validation |
 
 **Loading / parameterization:** services `from app.prompts import ...` then call `PROMPT.format(**vars)`. So `{placeholder}` = a real format key, and any *literal* `{}` (e.g. JSON examples) **must be doubled `{{ }}`** — see `EXTRACT_KEYWORDS_PROMPT`, `DIFF_IMPROVE_PROMPT`, the enrichment prompts. `PARSE_RESUME_PROMPT` is the exception: it embeds the schema via `{schema}` so it does *not* double-brace.
 
-**Improve prompt selection:** `IMPROVE_RESUME_PROMPTS` = `{nudge, keywords, full}`; `IMPROVE_PROMPT_OPTIONS` is the UI list; `DEFAULT_IMPROVE_PROMPT_ID = "keywords"`. The active id comes from `config.json` `default_prompt_id` (validated against option ids) or the request's `prompt_id`. `CRITICAL_TRUTHFULNESS_RULES[id]` is injected into each improve prompt via `{critical_truthfulness_rules}`.
+**Improve prompt selection:** `IMPROVE_RESUME_PROMPTS` = `{nudge, keywords, full, heavy}` (`heavy` = Heavy rewrite: full CAR rewrites, new summary, bullet reorder via a deferred `reorder` diff on a description path); `IMPROVE_PROMPT_OPTIONS` is the UI list; `DEFAULT_IMPROVE_PROMPT_ID = "keywords"`. The active id comes from `config.json` `default_prompt_id` (validated against option ids) or the request's `prompt_id`. `CRITICAL_TRUTHFULNESS_RULES[id]` is injected into each improve prompt via `{critical_truthfulness_rules}`.
+
+**Follow-up email (`FOLLOW_UP_EMAIL_PROMPT`):** inputs are `{application_context}` (Company, Role, and `Applied: N days ago` when the applied date is known), `{job_description}`, `{resume_data}` and `{output_language}`. It asks for a `Subject:` line and a 60-120 word body that restates interest, gives one evidence-backed match (with a real result when the resume has one), asks politely about the timeline, and signs off with the candidate's name. It greets a hiring contact only when the job description names one, and must not invent contacts, conversations, interviews, dates or metrics. Not user-editable. `services/cover_letter.py::generate_follow_up_email` builds it; the draft is returned to the tracker modal for the user to edit and copy, never saved.
+
+**Cover letter default (`COVER_LETTER_PROMPT`):** under one page, 200-300 words in 3-4 paragraphs: an opening hook tied to one detail of the job description, two or three evidence-backed matches from the resume (in the job's terminology), a company-fit paragraph grounded only in what the job description states, and a specific call to action. Tone and US/UK/AU/NZ conventions are inferred from the inputs; a named greeting only when the inputs name someone ("Dear Hiring Manager" otherwise). It must not invent experience, metrics, motivations or company facts. Agent mode follows the same shape (the resume-matcher SKILL.md "Cover letter" row; a test keeps the word range in sync). Adapted from the jezweb resume-cover-letter skill.
 
 **Custom feature prompts (user-editable):** cover-letter & outreach prompts can be overridden in `config.json` (`cover_letter_prompt`, `outreach_message_prompt`). On save (`PUT /config/feature-prompts`) they are validated by `validate_prompt_placeholders()` to contain all of `REQUIRED_FEATURE_PROMPT_PLACEHOLDERS` = `{job_description}`, `{resume_data}`, `{output_language}`; missing → HTTP 422. Empty string = "use default". At runtime `cover_letter.py::_resolve_feature_prompt` picks custom-or-default and falls back to the built-in default (with a warning) if a custom prompt fails `.format()`.
 
@@ -84,7 +96,7 @@ Prompts are **plain Python string constants** — no Jinja, no external prompt f
 - **Capabilities via registry, not hardcoded:** `_supports_json_mode`, `_supports_temperature`, `get_safe_max_tokens` query `litellm.get_model_info` (with Ollama/local fallbacks). `litellm.drop_params = True` lets unsupported params (e.g. `reasoning_effort`) be dropped silently.
 - **Timeouts:** adaptive (`_calculate_timeout`): base 30s health / 120s completion / 180s JSON, scaled by token count and a provider factor (ollama 2x, openrouter 1.5x...).
 - **Reasoning models:** `<think>` tags stripped; `reasoning_content`/`thinking` used as content fallback. gpt-5 configs auto-migrate to `reasoning_effort="minimal"` once.
-- **Key resolution:** single source of truth is `resolve_api_key(stored, provider)`. `openai_compatible`/`ollama` deliberately **skip** the env-level `LLM_API_KEY` fallback so a paid key can't leak to a local server. Error text is scrubbed of key-like tokens (`_scrub_secrets`) before reaching clients.
+- **Key resolution:** single source of truth is `resolve_api_key(stored, provider)`. `openai_compatible`/`ollama` deliberately **skip** the env-level `LLM_API_KEY` fallback so a paid key can't leak to a local server. Error text is scrubbed of key-like tokens (`_scrub_secrets`) before reaching clients, and every log record is too (see **Logs are redacted centrally** below).
 - API keys are passed directly to LiteLLM calls (never via `os.environ`) to avoid async races.
 
 ---
@@ -96,8 +108,9 @@ cd apps/backend
 uv sync                                              # install deps (creates .venv)
 uv run uvicorn app.main:app --reload --port 8000     # dev server on :8000
 uv run app                                           # console script (app.main:main, uses HOST/PORT/RELOAD)
+uv run resume-matcher-mcp                            # MCP server over stdio (see features/mcp-server.md)
 uv run ruff check                                    # lint backend
-uv run ruff format                                   # format backend
+uv run ruff format <files>                           # format only the files you changed (not the whole backend)
 uv run playwright install chromium                   # one-time, required for PDF endpoints
 ```
 Config via `.env` (see `.env.example`). Interactive API docs at `/docs`.
@@ -122,12 +135,16 @@ Config via `.env` (see `.env.example`). Interactive API docs at `/docs`.
 ## Key Gotchas
 
 - **uv.lock is gitignored** (`.gitignore`), so dependency resolution isn't reproducible from VCS — rely on the exact pins in `pyproject.toml` / `requirements.txt`.
-- **litellm ↔ python-dotenv trap:** litellm `<1.84.0` hard-pinned `python-dotenv==1.0.1`, which used to fight other pins. Resolved at the current pins (`litellm==1.86.2`, `python-dotenv==1.2.2`); do **not** downgrade litellm below 1.84 without re-checking dotenv.
-- **Keys vs non-secret config:** API **keys** live ONLY in the encrypted `api_keys` SQLite table (per-provider, via `_PROVIDER_KEY_MAP`); `load_config_file()` injects the decrypted keys into the returned dict and `save_config_file()` strips them, so secrets never round-trip to `config.json`. Non-secret provider/model/base/features stay in `config.json`. `PUT /config/llm-api-key` no longer writes any key; keys go through `PUT /config/api-keys`. `migrate_legacy_keys()` folds any legacy plaintext keys into the encrypted store (idempotent, non-clobbering). After any write to `config.json`, call `invalidate_config_cache()`.
-- **Master resume invariant:** up to `MAX_MASTER_RESUMES` (5) resumes have `is_master=True`; `is_default_master` implies `is_master`. The partial unique index on `is_default_master` guarantees at most one default; application logic keeps exactly one whenever any master exists: a new master becomes the default when none exists, deleting the default promotes the earliest remaining master, and the startup migration (`db_engine.py`) promotes the earliest master when none is default. `set_default_master_resume` (replaces `set_master_resume`) switches it. `create_resume_atomic_master` counts and inserts in one `BEGIN IMMEDIATE` write transaction (raises `MasterResumeLimitError` at the limit) and, with `take_over_stuck_default=True`, hands the default to the new upload when the current default is stuck `failed`/`processing`; duplicates pass `False`.
+- **litellm ↔ python-dotenv trap:** litellm `<1.84.0` hard-pinned `python-dotenv==1.0.1`, which used to fight other pins. Resolved at the current pins (`litellm==1.104.2`, `python-dotenv==1.2.4`); do **not** downgrade litellm below 1.84 without re-checking dotenv.
+- **LiteLLM loads on first use:** importing it costs about 1 s and 160 MB, and agent mode never calls a model. So nothing imports it at module level: inside `app/llm.py` call `_litellm()`, which imports and configures it once. `app.llm.litellm` still resolves (through a module `__getattr__`) for tests that patch it. `tests/unit/test_lazy_litellm.py` fails if the CLI, the server import, or an agent-mode `/status` loads it.
+- **Logs are redacted centrally:** provider errors can echo the API key (OpenAI: `Incorrect API key provided: sk-proj-…`), and routes log exception text per rule 2. `app/__init__.py` calls `install_log_redaction()` (`app/redaction.py`), which runs `redact_credentials` over the message, traceback and stack of every log record in the process: server, CLI, MCP and scripts. So keep logging `e` as rule 2 shows; don't scrub at each call site. LiteLLM's own `SecretRedactionFilter` covers only some library loggers (`httpx`, `uvicorn`), not `app.*`. `CREDENTIAL_PATTERNS` in that module is the one list of key patterns; `llm._scrub_secrets` uses it too. Tests: `tests/unit/test_log_redaction.py`.
+- **litellm model map is pinned to the bundled copy:** LiteLLM downloads its model registry from GitHub at import unless `LITELLM_LOCAL_MODEL_COST_MAP=True`; `app/__init__.py` defaults it to `True` (via `setdefault`, before any litellm import), so capability answers (`_supports_temperature`, JSON mode, max tokens) only change with a version bump. Set the env var to `False` to use the live registry. Don't import litellm from code that can run before `app` is imported. GPT-5 temperature follows LiteLLM's rule: non-default only when the effective effort (configured, else `default_reasoning_effort`) is `none` — see [`llm-integration.md`](../../docs/agent/llm-integration.md#temperature-support).
+- **markitdown needs the `[pdf]` extra:** since 0.1.5 its PDF converter requires `pdfplumber` (+ Pillow, pypdfium2); with only `[docx]` PDF uploads fail with `MissingDependencyException`. Keep `pdfminer.six` pinned directly too — `parser.py` and `page_fit.py` import it.
+- **Keys vs non-secret config:** API **keys** live ONLY in the encrypted `api_keys` table of the selected database (SQLite, or PostgreSQL when `DATABASE_URL` is set; per-provider, via `_PROVIDER_KEY_MAP`); `load_config_file()` injects the decrypted keys into the returned dict and `save_config_file()` strips them, so secrets never round-trip to `config.json`. Non-secret provider/model/base/features stay in `config.json`. `PUT /config/llm-api-key` no longer writes any key; keys go through `PUT /config/api-keys`. `migrate_legacy_keys()` folds any legacy plaintext keys into the encrypted store (idempotent, non-clobbering). After any write to `config.json`, call `invalidate_config_cache()`.
+- **Master resume invariant:** up to `MAX_MASTER_RESUMES` (5) resumes have `is_master=True`; `is_default_master` implies `is_master`. The partial unique index on `is_default_master` guarantees at most one default; application logic keeps exactly one whenever any master exists: a new master becomes the default when none exists, deleting the default promotes the earliest remaining master, and the startup migration (`db_engine.py`) promotes the earliest master when none is default. `set_default_master_resume` (replaces `set_master_resume`) switches it. `create_resume_atomic_master` counts and inserts in one reserved write transaction (`BEGIN IMMEDIATE`, or the Postgres advisory lock) (raises `MasterResumeLimitError` at the limit) and, with `take_over_stuck_default=True`, hands the default to the new upload when the current default is stuck `failed`/`processing`; duplicates pass `False`.
 - **Dates lose months:** LLMs drop month precision; `restore_dates_from_markdown` + `_restore_original_dates` re-insert them. Preserve this when editing the parse/improve flow.
 - **Single-worker assumption:** caches and locks assume one uvicorn worker / cooperative async. Don't add cross-worker shared mutable state without revisiting `config_cache` and the master lock.
-- **PDF needs the frontend running** (`FRONTEND_BASE_URL`, default `http://localhost:3000`) — Chromium renders `/print/*` pages. Browser is lazily initialized on first PDF request.
+- **PDF needs the frontend running** (`FRONTEND_BASE_URL`, default `http://localhost:3000`) — Chromium renders `/print/*` pages. The shared browser launches on the first PDF request and closes after 5 minutes without one (`PDF_BROWSER_IDLE_SECONDS`, default 300); the next export relaunches it (about 0.4 s).
 - **Improve/confirm requires a prior preview** — it validates `preview_hash`; arbitrary payloads are rejected (400).
 
 ---
@@ -145,6 +162,9 @@ Config via `.env` (see `.env.example`). Interactive API docs at `/docs`.
 | Scope / principles | [`scope-and-principles.md`](../../docs/agent/scope-and-principles.md) · [`workflow.md`](../../docs/agent/workflow.md) |
 | AI enrichment | [`features/enrichment.md`](../../docs/agent/features/enrichment.md) |
 | JD matching | [`features/jd-match.md`](../../docs/agent/features/jd-match.md) |
+| MCP server | [`features/mcp-server.md`](../../docs/agent/features/mcp-server.md) |
+| ATS parse-check | [`features/ats-parse-check.md`](../../docs/agent/features/ats-parse-check.md) |
+| PostgreSQL backend | [`features/postgres-backend.md`](../../docs/agent/features/postgres-backend.md) |
 | Custom sections | [`features/custom-sections.md`](../../docs/agent/features/custom-sections.md) |
 | i18n | [`features/i18n.md`](../../docs/agent/features/i18n.md) |
 | PDF / templates | [`design/pdf-template-guide.md`](../../docs/agent/design/pdf-template-guide.md) · [`design/template-system.md`](../../docs/agent/design/template-system.md) |
@@ -164,7 +184,7 @@ Layout (`apps/backend/tests/`):
 | `integration/` | endpoints via httpx `ASGITransport` | config/health/jobs/resume/upload, plus `test_llm_contract.py` (real `llm.py` over `respx`) and `test_pipeline_e2e.py` (upload→tailor→render, real routers + real temp DB) |
 | `evals/` | prompt quality | pure structural scorers (always run) + a gated LLM-judge (`@pytest.mark.eval`, uses the dev's own key; run with `uv run pytest -m eval`) |
 
-Key fixtures/tools: `conftest.py::isolated_db` swaps the global `db` singleton for a disposable temp-file SQLite database across **all** router modules (for real-DB endpoint/e2e tests); `respx` mocks the HTTP transport so `llm.py`'s real routing runs against a fake Ollama / OpenAI server (gotcha: litellm 1.86 needs `disable_aiohttp_transport=True` for respx to intercept). Keep every test **anti-theater** — it must fail when its target breaks.
+Key fixtures/tools: `conftest.py::isolated_db` swaps the global `db` singleton for a disposable temp-file SQLite database across **all** router modules (for real-DB endpoint/e2e tests); `respx` mocks the HTTP transport so `llm.py`'s real routing runs against a fake Ollama / OpenAI server (gotcha: litellm defaults to an aiohttp transport, so tests need `disable_aiohttp_transport=True` for respx to intercept). Keep every test **anti-theater** — it must fail when its target breaks.
 
 **Local push gate:** `.githooks/pre-push` runs this suite + a locale-parity check and blocks red pushes (`git config core.hooksPath .githooks`; see [`.githooks/README.md`](../../.githooks/README.md)). We avoid a GitHub Actions PR gate (high external-PR volume).
 

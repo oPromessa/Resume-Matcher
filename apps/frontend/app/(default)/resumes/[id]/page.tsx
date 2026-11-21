@@ -2,9 +2,17 @@
 
 import React, { useEffect, useMemo, useState, useRef, useLayoutEffect } from 'react';
 import { useRouter, useParams } from 'next/navigation';
+import { Alert } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
-import Resume, { ResumeData } from '@/components/dashboard/resume-component';
+import { Input } from '@/components/ui/input';
+import { PageFrame } from '@/components/ui/page-frame';
+import { PageHeader } from '@/components/ui/page-header';
+import { StatusIndicator } from '@/components/ui/status-indicator';
+import { toast } from '@/components/ui/toaster';
+import { DefaultBadge } from '@/components/common/default-badge';
+import Resume, { type ResumeData } from '@/components/dashboard/resume-component';
+import { PaginatedPreview } from '@/components/preview';
 import {
   fetchResume,
   downloadResumePdf,
@@ -17,22 +25,23 @@ import {
 } from '@/lib/api/resume';
 import { useStatusCache } from '@/lib/context/status-cache';
 import {
-  ArrowLeft,
-  Edit,
-  Download,
-  Loader2,
-  AlertCircle,
-  Sparkles,
-  Pencil,
-  MessagesSquare,
+  NotePencil,
+  DownloadSimple,
+  SpinnerGap,
+  PencilSimple,
+  Chats,
   Copy,
-} from 'lucide-react';
+} from '@phosphor-icons/react';
 import { EnrichmentModal } from '@/components/enrichment/enrichment-modal';
+import { AgentPromptDialog } from '@/components/agent/agent-prompt-dialog';
 import { useTranslations } from '@/lib/i18n';
 import { withLocalizedDefaultSections } from '@/lib/utils/section-helpers';
+import { isSameResumeData } from '@/lib/utils/resume-draft-storage';
+import { useAgentRefresh } from '@/hooks/use-agent-refresh';
 import { useLanguage } from '@/lib/context/language-context';
 import { downloadBlobAsFile, openUrlInNewTab, sanitizeFilename } from '@/lib/utils/download';
 import { useOperationOwner } from '@/hooks/use-operation-owner';
+import { DEFAULT_TEMPLATE_SETTINGS, type TemplateSettings } from '@/lib/types/template-settings';
 
 type ProcessingStatus = 'pending' | 'processing' | 'ready' | 'failed';
 
@@ -45,7 +54,14 @@ export default function ResumeViewerPage() {
   const { uiLanguage } = useLanguage();
   const params = useParams();
   const router = useRouter();
-  const { incrementResumes, decrementResumes, setHasMasterResume } = useStatusCache();
+  const {
+    status: systemStatus,
+    incrementResumes,
+    decrementResumes,
+    setHasMasterResume,
+  } = useStatusCache();
+  // Agent mode: Enhance shows a prompt for the user's coding agent instead.
+  const agentMode = Boolean(systemStatus?.agent_mode);
   const [resumeData, setResumeData] = useState<ResumeData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +74,6 @@ export default function ResumeViewerPage() {
   const [showSetDefaultSuccessDialog, setShowSetDefaultSuccessDialog] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [showDeleteSuccessDialog, setShowDeleteSuccessDialog] = useState(false);
-  const [showDownloadSuccessDialog, setShowDownloadSuccessDialog] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [renameError, setRenameError] = useState<string | null>(null);
@@ -68,9 +83,16 @@ export default function ResumeViewerPage() {
   const [isDownloading, setIsDownloading] = useState(false);
   const [resumeTitle, setResumeTitle] = useState<string | null>(null);
   const renameBusyRef = useRef(false);
+  // Bumped when a rename starts and ends: an agent check that overlapped one
+  // must not put the old title back.
+  const titleWritesRef = useRef(0);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitleValue, setEditingTitleValue] = useState('');
   const [isTailoredResume, setIsTailoredResume] = useState(false);
+  // The resume's own formatting (saved in the builder), so this page and its PDF
+  // match the builder. A resume never formatted shows the defaults.
+  const [templateSettings, setTemplateSettings] =
+    useState<TemplateSettings>(DEFAULT_TEMPLATE_SETTINGS);
 
   const resumeId = params?.id as string;
   const {
@@ -103,7 +125,6 @@ export default function ResumeViewerPage() {
     setDeleteError(null);
     setShowDeleteDialog(false);
     setShowDeleteSuccessDialog(false);
-    setShowDownloadSuccessDialog(false);
     setShowSetDefaultSuccessDialog(false);
     setIsSettingDefault(false);
     setSetDefaultError(null);
@@ -130,6 +151,7 @@ export default function ResumeViewerPage() {
         setIsTailoredResume(Boolean(data.parent_id));
         setIsMasterResume(Boolean(data.is_master));
         setIsDefaultMaster(Boolean(data.is_default_master));
+        setTemplateSettings(data.template_settings ?? DEFAULT_TEMPLATE_SETTINGS);
 
         // Prioritize processed_resume if available (structured JSON)
         if (data.processed_resume) {
@@ -159,8 +181,30 @@ export default function ResumeViewerPage() {
       }
     };
 
-    loadResume();
+    void loadResume();
   }, [resumeId, beginResumeLoad, isCurrentResumeLoad]);
+
+  // Agent mode: show what the user's coding agent saves (e.g. after Enhance)
+  // without a reload. The title is left alone while the user renames it.
+  const viewedIdRef = useRef(resumeId);
+  useEffect(() => {
+    viewedIdRef.current = resumeId;
+  });
+  useAgentRefresh(agentMode && !loading && Boolean(resumeData), async () => {
+    const id = resumeId;
+    if (!id) return;
+    const titleWrites = titleWritesRef.current;
+    try {
+      const data = await fetchResume(id);
+      if (viewedIdRef.current !== id || !data.processed_resume) return;
+      const latest = data.processed_resume as ResumeData;
+      setResumeData((current) => (current && isSameResumeData(current, latest) ? current : latest));
+      const renamedMeanwhile = titleWritesRef.current !== titleWrites || renameBusyRef.current;
+      if (!isEditingTitle && !renamedMeanwhile) setResumeTitle(data.title ?? null);
+    } catch (err) {
+      console.warn('Could not check for agent changes:', err);
+    }
+  });
 
   const handleRetryProcessing = async () => {
     if (!resumeId) return;
@@ -270,6 +314,7 @@ export default function ResumeViewerPage() {
     const token = beginRename();
     if (token === null) return;
     renameBusyRef.current = true;
+    titleWritesRef.current += 1;
     setIsEditingTitle(false);
     try {
       setRenameError(null);
@@ -282,13 +327,14 @@ export default function ResumeViewerPage() {
       console.error('Failed to rename resume:', err);
       setRenameError(t('resumeViewer.errors.failedToRename'));
     } finally {
+      titleWritesRef.current += 1;
       if (isCurrentRename(token)) renameBusyRef.current = false;
     }
   };
 
   const handleTitleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
-      handleTitleSave();
+      void handleTitleSave();
     } else if (e.key === 'Escape') {
       setIsEditingTitle(false);
     }
@@ -329,16 +375,16 @@ export default function ResumeViewerPage() {
     setIsDownloading(true);
     try {
       setDownloadError(null);
-      const blob = await downloadResumePdf(resumeId, undefined, uiLanguage);
+      const blob = await downloadResumePdf(resumeId, templateSettings, uiLanguage);
       const filename = sanitizeFilename(resumeTitle, resumeId, 'resume');
       downloadBlobAsFile(blob, filename);
       if (!isCurrentDownload(token)) return;
-      setShowDownloadSuccessDialog(true);
+      toast.success(t('builder.alerts.downloadSuccess'));
     } catch (err) {
       if (!isCurrentDownload(token)) return;
       console.error('Failed to download resume:', err);
       if (err instanceof TypeError && err.message.includes('Failed to fetch')) {
-        const fallbackUrl = getResumePdfUrl(resumeId, undefined, uiLanguage);
+        const fallbackUrl = getResumePdfUrl(resumeId, templateSettings, uiLanguage);
         const didOpen = openUrlInNewTab(fallbackUrl);
         if (!didOpen) {
           setDownloadError(t('common.popupBlocked', { url: fallbackUrl }));
@@ -377,10 +423,6 @@ export default function ResumeViewerPage() {
   const handleDeleteSuccessConfirm = () => {
     setShowDeleteSuccessDialog(false);
     router.push('/dashboard');
-  };
-
-  const handleDownloadSuccessConfirm = () => {
-    setShowDownloadSuccessDialog(false);
   };
 
   // Delete-related dialogs, shared by the failed-processing error branch and the
@@ -440,12 +482,12 @@ export default function ResumeViewerPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-background">
-        <Loader2 className="w-10 h-10 animate-spin text-blue-700 mb-4" />
-        <p className="font-mono text-sm font-bold uppercase text-blue-700">
-          {t('resumeViewer.loading')}
-        </p>
-      </div>
+      <PageFrame>
+        <div className="flex items-center gap-3 p-8 md:p-12">
+          <SpinnerGap aria-hidden="true" className="size-6 animate-spin text-primary" />
+          <StatusIndicator tone="active">{t('resumeViewer.loading')}</StatusIndicator>
+        </div>
+      </PageFrame>
     );
   }
 
@@ -455,104 +497,55 @@ export default function ResumeViewerPage() {
 
     return (
       <>
-        <div className="min-h-screen flex flex-col items-center justify-center bg-background p-4">
-          <div
-            className={`border p-6 text-center max-w-md shadow-sw-default ${
-              isProcessing
-                ? 'bg-blue-50 border-blue-200'
-                : isFailed
-                  ? 'bg-orange-50 border-orange-200'
-                  : 'bg-red-50 border-red-200'
-            }`}
-          >
-            <div className="flex justify-center mb-4">
-              {isProcessing ? (
-                <Loader2 className="w-8 h-8 animate-spin text-blue-700" />
-              ) : isFailed ? (
-                <AlertCircle className="w-8 h-8 text-orange-600" />
-              ) : (
-                <AlertCircle className="w-8 h-8 text-red-600" />
-              )}
-            </div>
-            <p
-              className={`font-bold mb-4 ${
-                isProcessing ? 'text-blue-700' : isFailed ? 'text-orange-700' : 'text-red-700'
-              }`}
-            >
+        <PageFrame>
+          <div className="flex max-w-2xl flex-col gap-6 p-8 md:p-12">
+            <Alert tone={isProcessing ? 'info' : isFailed ? 'warning' : 'error'}>
               {error || t('resumeViewer.resumeNotFound')}
-            </p>
-            <div className="flex flex-col gap-2">
+            </Alert>
+            <div className="flex flex-wrap gap-3">
               {isFailed && (
                 <>
-                  <Button onClick={handleRetryProcessing} disabled={isRetrying}>
+                  <Button type="button" onClick={handleRetryProcessing} disabled={isRetrying}>
                     {isRetrying ? (
                       <>
-                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        <SpinnerGap aria-hidden="true" className="animate-spin" />
                         {t('common.processing')}
                       </>
                     ) : (
                       t('resumeViewer.retryProcessing')
                     )}
                   </Button>
-                  <Button variant="destructive" onClick={() => setShowDeleteDialog(true)}>
+                  <Button
+                    type="button"
+                    variant="outline-destructive"
+                    onClick={() => setShowDeleteDialog(true)}
+                  >
                     {t('resumeViewer.deleteAndStartOver')}
                   </Button>
                 </>
               )}
-              <Button variant="outline" onClick={() => router.push('/dashboard')}>
+              <Button type="button" variant="outline" onClick={() => router.push('/dashboard')}>
                 {t('resumeViewer.returnToDashboard')}
               </Button>
             </div>
           </div>
-        </div>
+        </PageFrame>
         {deleteDialogs}
       </>
     );
   }
 
   return (
-    <div className="min-h-screen bg-background py-12 px-4 md:px-8 overflow-y-auto">
-      <div className="max-w-7xl mx-auto">
-        {/* Header Actions */}
-        <div className="mb-8 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 no-print">
-          <Button variant="outline" onClick={() => router.push('/dashboard')}>
-            <ArrowLeft className="w-4 h-4" />
-            {t('nav.backToDashboard')}
-          </Button>
+    <PageFrame>
+      <PageHeader className="no-print">
+        <PageHeader.Back href="/dashboard">{t('nav.backToDashboard')}</PageHeader.Back>
 
-          <div className="flex gap-3">
-            {isMasterResume && (
-              <Button onClick={() => setShowEnrichmentModal(true)} className="gap-2">
-                <Sparkles className="w-4 h-4" />
-                {t('resumeViewer.enhanceResume')}
-              </Button>
-            )}
-            <Button variant="outline" onClick={handleEdit}>
-              <Edit className="w-4 h-4" />
-              {t('dashboard.editResume')}
-            </Button>
-            <Button variant="outline" onClick={handleDuplicate} disabled={isDuplicating}>
-              <Copy className="w-4 h-4" />
-              {t('resumeViewer.duplicate')}
-            </Button>
-            {isTailoredResume && (
-              <Button variant="outline" onClick={handleInterviewPrep}>
-                <MessagesSquare className="w-4 h-4" />
-                {t('interviewPrep.title')}
-              </Button>
-            )}
-            <Button variant="success" onClick={handleDownload} disabled={isDownloading}>
-              <Download className="w-4 h-4" />
-              {isDownloading ? t('common.generating') : t('resumeViewer.downloadResume')}
-            </Button>
-          </div>
-        </div>
-
-        {/* Editable Title (the track name for a master) */}
-        <div className="mb-6 no-print flex flex-wrap items-center gap-4">
+        {/* Editable title (the track name for a master) */}
+        <div className="flex flex-wrap items-center gap-4">
           {isEditingTitle ? (
-            <input
+            <Input
               type="text"
+              aria-label={t('resumeViewer.renameTitle')}
               value={editingTitleValue}
               onChange={(e) => setEditingTitleValue(e.target.value)}
               onBlur={handleTitleSave}
@@ -560,33 +553,32 @@ export default function ResumeViewerPage() {
               autoFocus
               maxLength={80}
               placeholder={t('resumeViewer.titlePlaceholder')}
-              className="font-serif text-2xl font-bold border-b-2 border-black bg-transparent outline-none w-full max-w-xl px-0 py-1"
+              className="h-12 max-w-xl font-serif text-2xl font-bold"
             />
           ) : (
-            <button
-              onClick={() => {
-                setEditingTitleValue(resumeTitle || '');
-                setIsEditingTitle(true);
-              }}
-              className="group flex items-center gap-2 cursor-pointer bg-transparent border-none p-0"
-            >
-              <h2
-                className={`font-serif text-2xl font-bold border-b-2 border-transparent group-hover:border-black transition-colors ${!resumeTitle ? 'text-steel-grey' : ''}`}
-              >
+            <>
+              <PageHeader.Title className={resumeTitle ? undefined : 'text-steel'}>
                 {resumeTitle || t('resumeViewer.titlePlaceholder')}
-              </h2>
-              <Pencil
-                className={`w-4 h-4 transition-opacity ${resumeTitle ? 'opacity-0 group-hover:opacity-60' : 'opacity-40 group-hover:opacity-60'}`}
-              />
-            </button>
+              </PageHeader.Title>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={t('resumeViewer.renameTitle')}
+                className="text-steel hover:text-ink"
+                onClick={() => {
+                  setEditingTitleValue(resumeTitle || '');
+                  setIsEditingTitle(true);
+                }}
+              >
+                <PencilSimple aria-hidden="true" />
+              </Button>
+            </>
           )}
-          {isDefaultMaster && (
-            <span className="shrink-0 font-mono text-xs uppercase border border-black px-1 rounded-none">
-              {t('resumeViewer.defaultBadge')}
-            </span>
-          )}
+          {isDefaultMaster && <DefaultBadge>{t('resumeViewer.defaultBadge')}</DefaultBadge>}
           {isMasterResume && !isDefaultMaster && (
             <Button
+              type="button"
               variant="outline"
               size="sm"
               onClick={handleSetDefault}
@@ -597,11 +589,54 @@ export default function ResumeViewerPage() {
           )}
         </div>
 
+        <PageHeader.Actions>
+          {isMasterResume && (
+            <Button type="button" onClick={() => setShowEnrichmentModal(true)}>
+              {t('resumeViewer.enhanceResume')}
+            </Button>
+          )}
+          <Button type="button" variant="outline" onClick={handleEdit}>
+            <NotePencil aria-hidden="true" />
+            {t('dashboard.editResume')}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleDuplicate}
+            disabled={isDuplicating}
+          >
+            <Copy aria-hidden="true" />
+            {t('resumeViewer.duplicate')}
+          </Button>
+          {isTailoredResume && (
+            <Button type="button" variant="outline" onClick={handleInterviewPrep}>
+              <Chats aria-hidden="true" />
+              {t('interviewPrep.title')}
+            </Button>
+          )}
+          <Button type="button" variant="outline" onClick={handleDownload} disabled={isDownloading}>
+            <DownloadSimple aria-hidden="true" />
+            {isDownloading ? t('common.generating') : t('resumeViewer.downloadResume')}
+          </Button>
+        </PageHeader.Actions>
+      </PageHeader>
+
+      <div className="px-8 py-6 md:px-12 md:py-8">
         {/* Resume Viewer */}
         <div className="flex justify-center pb-4">
-          <div className="resume-print w-full max-w-[250mm] shadow-sw-lg border-2 border-black bg-white">
+          <div className="no-print w-full max-w-[250mm] border border-ink">
+            <PaginatedPreview
+              resumeData={localizedResumeData || resumeData}
+              settings={templateSettings}
+            />
+          </div>
+          {/* Browser printing shows only .resume-print (globals.css), so print this copy
+              instead of the paginated preview and its controls. */}
+          <div className="resume-print hidden print:block">
             <Resume
               resumeData={localizedResumeData || resumeData}
+              template={templateSettings.template}
+              settings={templateSettings}
               additionalSectionLabels={{
                 technicalSkills: t('resume.additionalLabels.technicalSkills'),
                 languages: t('resume.additionalLabels.languages'),
@@ -618,14 +653,15 @@ export default function ResumeViewerPage() {
                 languages: t('resume.sections.languages'),
                 awards: t('resume.sections.awards'),
                 links: t('resume.sections.links'),
+                earlierExperience: t('resume.sections.earlierExperience'),
               }}
               fallbackLabels={{ name: t('resume.defaults.name') }}
             />
           </div>
         </div>
 
-        <div className="flex justify-end pt-4 no-print">
-          <Button variant="destructive" onClick={() => setShowDeleteDialog(true)}>
+        <div className="flex pt-4 no-print">
+          <Button type="button" variant="destructive" onClick={() => setShowDeleteDialog(true)}>
             {isMasterResume
               ? t('confirmations.deleteMasterResumeTitle')
               : t('dashboard.deleteResume')}
@@ -693,19 +729,15 @@ export default function ResumeViewerPage() {
         showCancelButton={false}
       />
 
-      <ConfirmDialog
-        open={showDownloadSuccessDialog}
-        onOpenChange={setShowDownloadSuccessDialog}
-        title={t('common.success')}
-        description={t('builder.alerts.downloadSuccess')}
-        confirmLabel={t('common.ok')}
-        onConfirm={handleDownloadSuccessConfirm}
-        variant="success"
-        showCancelButton={false}
-      />
-
       {/* Enrichment Modal - Only for master resume */}
-      {isMasterResume && (
+      {isMasterResume && agentMode && (
+        <AgentPromptDialog
+          task={showEnrichmentModal ? 'enhance' : null}
+          resumeId={resumeId}
+          onClose={() => setShowEnrichmentModal(false)}
+        />
+      )}
+      {isMasterResume && !agentMode && (
         <EnrichmentModal
           resumeId={resumeId}
           isOpen={showEnrichmentModal}
@@ -713,6 +745,6 @@ export default function ResumeViewerPage() {
           onComplete={handleEnrichmentComplete}
         />
       )}
-    </div>
+    </PageFrame>
   );
 }

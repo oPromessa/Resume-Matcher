@@ -499,6 +499,9 @@ async def test_deadline_during_claim_retires_committed_owner_before_returning(
         await asyncio.sleep(0.1)
         return token
 
+    # Initialize the database first so the short deadline lands in the claim,
+    # not in first-use schema setup (slow on PostgreSQL).
+    await isolated_db.list_resumes()
     monkeypatch.setattr(settings, "request_timeout_seconds", 0.04)
     monkeypatch.setattr(isolated_db, "claim_resume_processing", slow_claim)
     monkeypatch.setattr(
@@ -638,7 +641,8 @@ async def test_explicit_parse_boundary_failure_retires_owned_attempt(
     assert response.status_code == expected, response.text
     records = await isolated_db.list_resumes()
     assert len(records) == 1 and records[0]["processing_status"] == "failed"
-    assert records[0]["processed_data"] is None
+    record = await isolated_db.get_resume(records[0]["resume_id"])
+    assert record is not None and record["processed_data"] is None
 
 
 @pytest.mark.parametrize("failure", ["deadline", "prompt"])

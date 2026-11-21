@@ -10,7 +10,10 @@ export type LLMProvider =
   | 'gemini'
   | 'deepseek'
   | 'groq'
-  | 'ollama';
+  | 'ollama'
+  | 'claude_cli'
+  | 'chatgpt'
+  | 'agent';
 
 // Reasoning-effort levels supported by LiteLLM. `null` (or absent) means
 // "do not send the parameter" — the default for max compatibility.
@@ -44,6 +47,8 @@ export interface SystemStatus {
   status: 'ready' | 'setup_required';
   llm_configured: boolean;
   llm_healthy: boolean;
+  /** The user's coding agent does the AI work; the app makes no model calls. */
+  agent_mode?: boolean;
   has_master_resume: boolean;
   database_stats: DatabaseStats;
 }
@@ -74,12 +79,6 @@ export async function fetchLlmConfig(): Promise<LLMConfig> {
   return res.json();
 }
 
-// Legacy function for backwards compatibility
-export async function fetchLlmApiKey(): Promise<string> {
-  const config = await fetchLlmConfig();
-  return config.api_key ?? '';
-}
-
 // Update LLM configuration
 export async function updateLlmConfig(config: LLMConfigUpdate): Promise<LLMConfig> {
   const res = await apiFetch('/config/llm-api-key', {
@@ -103,17 +102,29 @@ export async function updateLlmConfig(config: LLMConfigUpdate): Promise<LLMConfi
     } else {
       message = `Failed to update LLM config (status ${res.status}).`;
     }
-    throw new Error(message);
+    const code =
+      data.detail && typeof data.detail === 'object' && 'code' in data.detail
+        ? String((data.detail as { code: unknown }).code)
+        : undefined;
+    throw new LlmConfigError(message, code);
   }
 
   return res.json();
 }
 
-// Legacy function for backwards compatibility
-export async function updateLlmApiKey(value: string): Promise<string> {
-  const config = await updateLlmConfig({ api_key: value });
-  return config.api_key ?? '';
+/** Raised by updateLlmConfig; `code` is the server's structured error code, if any. */
+export class LlmConfigError extends Error {
+  code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = 'LlmConfigError';
+    this.code = code;
+  }
 }
+
+/** The server refuses to move a saved key to a new endpoint unless the key is sent too. */
+export const API_KEY_REQUIRED_FOR_ENDPOINT = 'api_key_required_for_endpoint';
 
 // Test LLM connection with optional config (for pre-save testing)
 export async function testLlmConnection(config?: LLMConfigUpdate): Promise<LLMHealthCheck> {
@@ -168,6 +179,21 @@ export const PROVIDER_INFO: Record<
      */
     baseUrlI18nKey?: string;
     baseUrlPlaceholder?: string;
+    /**
+     * Served by a CLI installed on the machine running the backend. There is no
+     * key, endpoint or reasoning effort to configure; the model is a CLI alias.
+     */
+    localCli?: boolean;
+    /**
+     * Signs in with ChatGPT (OAuth) instead of taking a key, endpoint or reasoning
+     * effort; the settings page shows the connection panel for it.
+     */
+    chatgptSignIn?: boolean;
+    /**
+     * The user's coding agent does the AI work through the resume-matcher command.
+     * There is no key, model, endpoint or reasoning effort to configure.
+     */
+    agentMode?: boolean;
   }
 > = {
   openai: { name: 'OpenAI', defaultModel: 'gpt-5-nano-2025-08-07', requiresKey: true },
@@ -202,6 +228,34 @@ export const PROVIDER_INFO: Record<
     defaultModel: 'gemma3:4b',
     requiresKey: false,
     defaultBaseUrl: 'http://localhost:11434',
+  },
+  // Runs the `claude` CLI already signed in on this machine. defaultModel is the
+  // sentinel for Claude Code's own default model (no --model flag). The settings page
+  // shows a translated name (settings.llmConfiguration.claudeCliName); this is the
+  // English fallback.
+  claude_cli: {
+    name: 'Claude subscription (via Claude Code)',
+    defaultModel: 'claude_cli',
+    requiresKey: false,
+    localCli: true,
+  },
+  // OpenAI's official Sign in with ChatGPT for open-source apps (preview). The
+  // backend holds the tokens. The model normally comes from the signed-in
+  // account's catalog; defaultModel (the docs' example slug) is only the fallback.
+  // The settings page shows a translated name (settings.llmConfiguration.chatgptName).
+  chatgpt: {
+    name: 'ChatGPT plan (Sign in with ChatGPT)',
+    defaultModel: 'gpt-6.1-sol',
+    requiresKey: false,
+    chatgptSignIn: true,
+  },
+  // No model of the app's own: defaultModel is only a placeholder the backend
+  // stores. The settings page shows a translated name (settings.llmConfiguration.agentName).
+  agent: {
+    name: 'Coding agent',
+    defaultModel: 'agent',
+    requiresKey: false,
+    agentMode: true,
   },
 };
 

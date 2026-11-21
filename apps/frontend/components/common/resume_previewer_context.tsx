@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, ReactNode } from 'react';
 import type { BulletSelectionSummary } from '@/lib/api/resume';
+import type { WritingReport } from '@/lib/api/writing';
 
 export interface PersonalInfo {
   name: string;
@@ -51,7 +52,11 @@ export interface AdditionalInfo {
 export interface ATSSubScores {
   keyword_match: number;
   skills_coverage: number;
+  /** Null when the job posting has no title. */
+  title_match?: number | null;
   section_completeness: number;
+  /** Null when the resume has fewer than two dates. */
+  date_consistency?: number | null;
 }
 
 export interface ATSScore {
@@ -142,6 +147,17 @@ export interface Data {
   detailed_changes?: ResumeFieldDiff[];
   ats_score?: ATSScore;
   bullet_selection?: BulletSelectionSummary | null;
+  writing?: WritingReport | null;
+  /** Where each forced keyword landed (apply-keywords responses). */
+  keyword_placements?: KeywordPlacement[];
+  /** Keywords the user forced into this preview. */
+  forced_keywords?: string[];
+}
+
+/** Where one forced keyword landed: line paths, or `additional.technicalSkills`. */
+export interface KeywordPlacement {
+  keyword: string;
+  paths: string[];
 }
 
 export interface ImprovedResult {

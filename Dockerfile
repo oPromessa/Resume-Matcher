@@ -4,7 +4,7 @@
 # ============================================
 # Stage 1: Build Frontend
 # ============================================
-FROM node:22-bookworm AS frontend-builder
+FROM node:26.13.1-bookworm AS frontend-builder
 
 # Build argument for API URL (allows customization at build time)
 # Default routes requests through Next.js rewrites on the same origin.
@@ -17,32 +17,63 @@ WORKDIR /app/frontend
 # Copy package files first for better caching
 COPY apps/frontend/package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (npm download cache kept between builds)
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
 
 # Copy frontend source
 COPY apps/frontend/ ./
 
-# Build the frontend
-RUN npm run build
+# Build the frontend (Next.js build cache kept between builds; it is not part of the
+# standalone output)
+RUN --mount=type=cache,target=/app/frontend/.next/cache \
+    npm run build
 
 # ============================================
 # Stage 2: Final Image
 # ============================================
-FROM python:3.13-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # Set environment variables
+# PIP_NO_CACHE_DIR is deliberately not set: the pip steps below use a BuildKit cache
+# mount (kept out of the image), and that mount only helps while pip's cache is on.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     NODE_ENV=production \
-    NEXT_TELEMETRY_DISABLED=1
+    NEXT_TELEMETRY_DISABLED=1 \
+    IN_CONTAINER=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Optional Debian mirrors for slow networks, e.g.
+#   docker build --build-arg DEBIAN_MIRROR=https://mirrors.edge.kernel.org/debian .
+# DEBIAN_MIRROR is the mirror's /debian URL (packages and updates). Most mirrors do not
+# carry debian-security, so that stays on the stock deb.debian.org unless you also set
+# DEBIAN_SECURITY_MIRROR (a /debian-security URL). Both are empty by default: the image's
+# stock sources are used unchanged. esc() backslash-escapes `&`, `|` (the sed delimiter)
+# and `\` so any URL is inserted literally into the sed replacement.
+ARG DEBIAN_MIRROR
+ARG DEBIAN_SECURITY_MIRROR
+RUN esc() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; } \
+    && if [ -n "${DEBIAN_MIRROR}" ]; then \
+        sed -i "s|^URIs: http://deb.debian.org/debian\$|URIs: $(esc "${DEBIAN_MIRROR%/}")|" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && if [ -n "${DEBIAN_SECURITY_MIRROR}" ]; then \
+        sed -i "s|^URIs: http://deb.debian.org/debian-security|URIs: $(esc "${DEBIAN_SECURITY_MIRROR%/}")|" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi
+
+# Install system dependencies. BuildKit cache mounts keep the downloaded .debs between
+# builds (docker-clean would delete them after install), so a re-run of this layer
+# does not download everything again. The mounts are not part of the image.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    # The Node.js binary copied from the frontend builder needs it (Node 26+)
+    libatomic1 \
     # Playwright dependencies
     libnss3 \
     libnspr4 \
@@ -61,25 +92,62 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     libatspi2.0-0 \
     libgtk-3-0 \
+    # Chromium for PDF export. Debian's build comes with security updates
+    # (bookworm-security; 156.0.8078.79 has the CVE-2026-118306 fix), unlike the
+    # build Playwright pins, so app/pdf.py uses it as the system executable.
+    chromium \
     # CJK fonts for Chinese/Japanese/Korean PDF rendering via Playwright
     fonts-noto-cjk \
-    && rm -rf /var/lib/apt/lists/*
+    && chromium --version \
+    # Fail the build if the security mirror served a Chromium without the fix.
+    && chromium_version="$(dpkg-query -W -f='${Version}' chromium)" \
+    && if ! dpkg --compare-versions "$chromium_version" ge 156.0.8078.73; then \
+        echo "chromium $chromium_version lacks the CVE-2026-118306 fix (156.0.8078.73)" >&2; \
+        exit 1; \
+    fi
+
+# ============================================
+# Python dependencies (cached across code changes)
+# ============================================
+# These layers only depend on pyproject.toml and requirements-lock.txt, so editing app
+# code or the frontend never re-downloads dependencies.
+WORKDIR /app/backend
+COPY apps/backend/pyproject.toml apps/backend/requirements-lock.txt /app/backend/
+
+# Optional Python package index mirror for slow networks, e.g.
+#   docker build --build-arg PIP_INDEX_URL=https://pypi.mirrors.ustc.edu.cn/simple .
+# pip reads PIP_INDEX_URL from the environment (an empty value is ignored), so both pip
+# installs below use it when set and the default PyPI otherwise.
+ARG PIP_INDEX_URL
+
+# Install the full dependency set, every package pinned and hash-checked, including the
+# build backend (hatchling) so the package install below needs nothing unpinned:
+# requirements-lock.txt is generated from pyproject.toml with a 3-day release-age
+# cutoff (command in its header), and tests/unit/test_requirements_lock.py keeps it in
+# step with pyproject's pins. pip check fails the build if the lock misses a package.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --require-hashes --no-deps -r requirements-lock.txt \
+    && pip check
 
 WORKDIR /app
 
 # Copy Node.js runtime from frontend builder for reproducible runtime behavior.
 COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node
+# Fail the build, not the container start, if a shared library Node needs is missing.
+RUN node --version
 
 # ============================================
 # Backend Setup
 # ============================================
-COPY apps/backend/pyproject.toml /app/backend/
 COPY apps/backend/app /app/backend/app
 
 WORKDIR /app/backend
 
-# Install Python dependencies
-RUN pip install .
+# Install the backend package itself with the pinned hatchling installed above (no
+# isolated build env, so pip downloads no build tools), then check the whole set again.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps --no-build-isolation . \
+    && pip check
 
 # ============================================
 # Frontend Setup
@@ -108,9 +176,6 @@ RUN useradd -m -u 1000 appuser \
     && chown -R appuser:appuser /app
 
 USER appuser
-
-# Install Playwright Chromium as appuser (so browsers are in correct location)
-RUN python -m playwright install chromium
 
 # Expose the public port (backend remains internal on 8000)
 EXPOSE 3000

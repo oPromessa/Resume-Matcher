@@ -2,95 +2,90 @@
 
 import { useMemo } from 'react';
 import { type ResumeData } from '@/components/dashboard/resume-component';
-import { extractKeywords, calculateMatchStats } from '@/lib/utils/keyword-matcher';
+import {
+  calculateMatchStats,
+  extractKeywords,
+  resumeKeywordText,
+} from '@/lib/utils/keyword-matcher';
 import { JDDisplay } from './jd-display';
 import { HighlightedResumeView } from './highlighted-resume-view';
-import { CheckCircle, Target } from 'lucide-react';
+import { CheckCircle, Target } from '@phosphor-icons/react';
 import { useTranslations } from '@/lib/i18n';
 
 interface JDComparisonViewProps {
   jobDescription: string;
   resumeData: ResumeData;
+  /** The job's saved keywords, the ones the ATS score counts; null when it has none. */
+  jobKeywords: string[] | null;
+  /** Hiring company, left out of the fallback word list. */
+  company?: string | null;
+  /** Keywords the user forced in; highlighted in blue. */
+  forcedKeywords?: string[];
 }
 
 /**
  * Split view comparing job description with resume.
  * Left: JD (read-only)
  * Right: Resume with matching keywords highlighted
+ *
+ * With saved job keywords the match is the ATS score's keyword match, live on the
+ * unsaved draft. Without them it falls back to word overlap with the posting.
  */
-export function JDComparisonView({ jobDescription, resumeData }: JDComparisonViewProps) {
+export function JDComparisonView({
+  jobDescription,
+  resumeData,
+  jobKeywords,
+  company,
+  forcedKeywords,
+}: JDComparisonViewProps) {
   const { t } = useTranslations();
 
-  // Extract keywords from JD
-  const keywords = useMemo(() => extractKeywords(jobDescription), [jobDescription]);
-
-  // Build full resume text for stats calculation
-  const resumeText = useMemo(() => {
-    const parts: string[] = [];
-
-    if (resumeData.summary) parts.push(resumeData.summary);
-
-    resumeData.workExperience?.forEach((exp) => {
-      if (exp.title) parts.push(exp.title);
-      if (exp.company) parts.push(exp.company);
-      exp.description?.forEach((d) => parts.push(d));
-    });
-
-    resumeData.education?.forEach((edu) => {
-      if (edu.degree) parts.push(edu.degree);
-      if (edu.institution) parts.push(edu.institution);
-    });
-
-    resumeData.personalProjects?.forEach((proj) => {
-      if (proj.name) parts.push(proj.name);
-      if (proj.role) parts.push(proj.role);
-      proj.description?.forEach((d) => parts.push(d));
-    });
-
-    if (resumeData.additional) {
-      resumeData.additional.technicalSkills?.forEach((s) => parts.push(s));
-      resumeData.additional.languages?.forEach((l) => parts.push(l));
-      resumeData.additional.certificationsTraining?.forEach((c) => parts.push(c));
-    }
-
-    return parts.join(' ');
-  }, [resumeData]);
-
-  // Calculate match statistics
+  const keywords = useMemo(
+    () => jobKeywords ?? [...extractKeywords(jobDescription, company ?? '')],
+    [jobKeywords, jobDescription, company]
+  );
+  const resumeText = useMemo(() => resumeKeywordText(resumeData), [resumeData]);
   const stats = useMemo(() => calculateMatchStats(resumeText, keywords), [resumeText, keywords]);
+
+  // Keyword match uses the ATS card's bands; word overlap runs lower, so it keeps its own.
+  const [high, mid] = jobKeywords ? [80, 60] : [50, 30];
 
   return (
     <div className="h-full flex flex-col">
       {/* Stats Bar */}
-      <div className="flex items-center justify-between px-4 py-3 bg-white border-b border-paper-tint">
+      <div className="flex items-center justify-between px-4 py-3 bg-white border-b border-paper">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2">
-            <Target className="w-4 h-4 text-blue-600" />
-            <span className="text-sm font-mono">
-              {t('builder.jdMatch.stats.keywordsExtracted', { count: keywords.size })}
+            <Target aria-hidden="true" className="size-4 text-primary" />
+            <span className="text-sm font-mono tabular-nums">
+              {jobKeywords
+                ? t('builder.jdMatch.stats.jobKeywords', { count: stats.totalKeywords })
+                : t('builder.jdMatch.stats.keywordsExtracted', { count: stats.totalKeywords })}
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <CheckCircle className="w-4 h-4 text-green-600" />
-            <span className="text-sm font-mono">
+            <CheckCircle aria-hidden="true" className="size-4 text-success" />
+            <span className="text-sm font-mono tabular-nums">
               {t('builder.jdMatch.stats.matchesFound', { count: stats.matchCount })}
             </span>
           </div>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-sm font-mono text-ink-soft">
-            {t('builder.jdMatch.stats.matchRateLabel')}
+            {jobKeywords
+              ? t('builder.jdMatch.stats.keywordMatchLabel')
+              : t('builder.jdMatch.stats.wordOverlapLabel')}
           </span>
           <span
-            className={`text-lg font-bold ${
-              stats.matchPercentage >= 50
-                ? 'text-green-600'
-                : stats.matchPercentage >= 30
-                  ? 'text-yellow-600'
-                  : 'text-red-600'
+            className={`text-lg font-bold tabular-nums ${
+              stats.matchPercentage >= high
+                ? 'text-success'
+                : stats.matchPercentage >= mid
+                  ? 'text-warning-text'
+                  : 'text-destructive'
             }`}
           >
-            {stats.matchPercentage}%
+            {stats.matchPercentage.toFixed(1)}%
           </span>
         </div>
       </div>
@@ -98,13 +93,17 @@ export function JDComparisonView({ jobDescription, resumeData }: JDComparisonVie
       {/* Split View */}
       <div className="flex-1 grid grid-cols-2 min-h-0">
         {/* Left: JD */}
-        <div className="border-r border-paper-tint overflow-hidden">
+        <div className="border-r border-paper overflow-hidden">
           <JDDisplay content={jobDescription} />
         </div>
 
         {/* Right: Resume with highlights */}
         <div className="overflow-hidden">
-          <HighlightedResumeView resumeData={resumeData} keywords={keywords} />
+          <HighlightedResumeView
+            resumeData={resumeData}
+            keywords={keywords}
+            forcedKeywords={forcedKeywords}
+          />
         </div>
       </div>
     </div>

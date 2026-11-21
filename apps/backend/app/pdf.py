@@ -5,18 +5,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, NoReturn, Optional, TypeVar
+from typing import Any, Awaitable, Callable, NoReturn, Optional, TypeVar
+from urllib.parse import urljoin, urlsplit
 
 from playwright.async_api import (
     Browser,
     Page,
     Playwright,
+    Route,
+    WebSocketRoute,
     async_playwright,
 )
 from playwright.async_api import (
@@ -98,12 +102,15 @@ _PDF_RENDER_TIMEOUT_SECONDS = _bounded_env_float(
 _PDF_CLEANUP_RESERVE_SECONDS = _bounded_env_float(
     "PDF_CLEANUP_RESERVE_SECONDS", 5.0, 0.1, 30.0
 )
+# Close the shared browser after this long without an export. An idle Chromium
+# holds hundreds of MB; relaunching it adds about 0.4 s to the next export.
+_PDF_BROWSER_IDLE_SECONDS = _bounded_env_float(
+    "PDF_BROWSER_IDLE_SECONDS", 300.0, 10.0, 86400.0
+)
 
 
 class PDFRenderError(Exception):
     """Custom exception for PDF rendering errors with helpful messages."""
-
-    pass
 
 
 class PDFRenderOverloadedError(PDFRenderError):
@@ -130,6 +137,7 @@ _subprocess_supported = True
 _admission_lock = threading.Lock()
 _active_renders = 0
 _background_owners: set[asyncio.Task[None]] = set()
+_idle_close: asyncio.TimerHandle | None = None
 
 
 @dataclass
@@ -190,6 +198,10 @@ async def _await_before_deadline(
     remaining = deadline - asyncio.get_running_loop().time()
     try:
         return await asyncio.wait_for(awaitable, timeout=max(0.0, remaining))
+    except _PDFDeadlineExceeded:
+        # Already tagged by the inner stage that ran out (e.g. the threaded
+        # worker's "resume readiness"); it is a TimeoutError, so keep it as is.
+        raise
     except (TimeoutError, PlaywrightTimeoutError) as error:
         raise _PDFDeadlineExceeded(stage) from error
 
@@ -356,6 +368,17 @@ def _find_chromium_executable() -> Optional[str]:
 
 
 async def _launch_browser(playwright: Playwright) -> Browser:
+    # Prefer the installed, auto-updated Chrome with its sandbox on: Playwright's
+    # pinned Chromium can lag Chrome's security fixes and runs unsandboxed by
+    # default (CVE-2026-118306). Without system Chrome (e.g. Docker), or where its
+    # sandbox cannot start, fall back to the pinned build.
+    try:
+        return await playwright.chromium.launch(channel="chrome", chromium_sandbox=True)
+    except PlaywrightError as error:
+        logger.info(
+            "System Chrome unavailable for PDF rendering, using Playwright's Chromium: %s",
+            str(error).splitlines()[0] if str(error) else type(error).__name__,
+        )
     try:
         return await playwright.chromium.launch()
     except PlaywrightError as e:
@@ -367,7 +390,20 @@ async def _launch_browser(playwright: Playwright) -> Browser:
                 "Playwright browser executable is missing, and no system Chrome/Edge "
                 "installation was found. Install Playwright browsers or install Chrome/Edge."
             ) from e
-        return await playwright.chromium.launch(executable_path=fallback_executable)
+        try:
+            return await playwright.chromium.launch(
+                executable_path=fallback_executable, chromium_sandbox=True
+            )
+        except PlaywrightError as error:
+            # Containers often can't start Chromium's sandbox (no user namespaces).
+            # The Docker image's Chromium comes from Debian's security updates, so
+            # it stays patched even without it.
+            logger.warning(
+                "Chromium sandbox unavailable for %s, rendering without it: %s",
+                fallback_executable,
+                str(error).splitlines()[0] if str(error) else type(error).__name__,
+            )
+            return await playwright.chromium.launch(executable_path=fallback_executable)
 
 
 async def _render_page_to_pdf(
@@ -388,7 +424,7 @@ async def _render_page_to_pdf(
     if work_deadline is None:
         work_deadline = asyncio.get_running_loop().time() + (_NAV_TIMEOUT_MS / 1000)
 
-    await _await_before_deadline(
+    response = await _await_before_deadline(
         page.goto(
             url,
             wait_until="load",
@@ -397,6 +433,21 @@ async def _render_page_to_pdf(
         work_deadline,
         "navigation",
     )
+    # goto does not raise on an HTTP error, and an error page never shows the
+    # resume, so waiting for it would only end in a misleading timeout. A 404
+    # usually means another app holds the frontend's port (e.g. Next.js moved
+    # to 3001 because 3000 was taken); a 500 means the print page crashed.
+    if response is not None and not response.ok:
+        logger.warning(
+            "Print page returned HTTP %d for %s; check that FRONTEND_BASE_URL "
+            "points at the running Resume Matcher frontend",
+            response.status,
+            _redact_draft_token(url),
+        )
+        raise PDFRenderError(
+            f"The print page failed to load (HTTP {response.status}). "
+            "Check that FRONTEND_BASE_URL points at the running Resume Matcher frontend."
+        )
     ready = await _await_before_deadline(
         page.wait_for_selector(
             selector,
@@ -414,7 +465,9 @@ async def _render_page_to_pdf(
             "resume readiness",
         )
         if isinstance(print_error, str):
-            logger.warning("Print page reported %r for %s", print_error, url)
+            logger.warning(
+                "Print page reported %r for %s", print_error, _redact_draft_token(url)
+            )
             raise PDFRenderError("The print page could not load the resume.")
     # Bound the fonts wait too — plain page.evaluate has no timeout, so a stuck
     # font load could otherwise hang the render past _NAV_TIMEOUT_MS.
@@ -437,6 +490,128 @@ async def _render_page_to_pdf(
     )
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_DRAFT_TOKEN_RE = re.compile(r"([?&]draft=)[^&#\s\"']*")
+
+
+def _redact_draft_token(text: str) -> str:
+    """Hide a page-fit draft token: it can fetch the unsaved resume it names."""
+    return _DRAFT_TOKEN_RE.sub(r"\1<redacted>", text)
+
+
+# A WebSocket belongs to the origin of the page that opens it.
+_SOCKET_SCHEMES = {"ws": "http", "wss": "https"}
+
+
+def _url_origin(url: str) -> tuple[str, str | None, int | None]:
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        # urllib rejects it (e.g. port 99999), so it matches no origin. A bad
+        # FRONTEND_BASE_URL then fails at navigation, as a PDFRenderError.
+        return "", None, -1
+    scheme = parts.scheme.lower()
+    scheme = _SOCKET_SCHEMES.get(scheme, scheme)
+    return scheme, parts.hostname, port or _DEFAULT_PORTS.get(scheme)
+
+
+def _same_origin_only(
+    url: str, page: Page, deadline: float
+) -> Callable[[Route], Awaitable[None]]:
+    """Route handler that lets the print page load only from its own origin.
+
+    Chromium follows a redirect without asking the route handler again, so each
+    request is fetched here with redirects off: a redirect reaches the page only
+    when it points back to the same origin, and the browser's follow-up request
+    comes through this handler again. Each fetch ends by the render deadline.
+    """
+    allowed = _url_origin(url)
+
+    async def handle(route: Route) -> None:
+        request_url = route.request.url
+        shown_url = _redact_draft_token(request_url)
+        try:
+            if _url_origin(request_url) != allowed:
+                logger.warning(
+                    "Blocked off-origin request during PDF render: %s", shown_url
+                )
+                await route.abort()
+                return
+            try:
+                response = await route.fetch(
+                    max_redirects=0, timeout=_stage_timeout_ms(deadline)
+                )
+            except PlaywrightError as error:
+                if not page.is_closed():
+                    logger.warning(
+                        "PDF render request failed for %s: %s",
+                        shown_url,
+                        _redact_draft_token(
+                            str(error).splitlines()[0]
+                            if str(error)
+                            else type(error).__name__
+                        ),
+                    )
+                # Keep the browser's own error so a down frontend still reads
+                # as net::ERR_CONNECTION_REFUSED (see _raise_playwright_error).
+                refused = "ECONNREFUSED" in str(error)
+                await route.abort("connectionrefused" if refused else "failed")
+                return
+            location = response.headers.get("location")
+            if 300 <= response.status < 400 and location:
+                try:
+                    target = urljoin(request_url, location)
+                    same_origin = _url_origin(target) == allowed
+                except ValueError:
+                    # urljoin rejects a malformed host, e.g. "http://[::1".
+                    target, same_origin = location, False
+                if not same_origin:
+                    logger.warning(
+                        "Blocked off-origin redirect during PDF render: %s -> %s",
+                        shown_url,
+                        _redact_draft_token(target),
+                    )
+                    await route.abort()
+                    return
+            await route.fulfill(response=response)
+        except PlaywrightError as error:
+            if page.is_closed():
+                # The render ended while this request was in flight.
+                logger.debug("PDF render request ended with its page: %s", shown_url)
+            else:
+                logger.warning(
+                    "PDF render request failed for %s: %s",
+                    shown_url,
+                    _redact_draft_token(str(error)),
+                )
+
+    return handle
+
+
+def _close_all_sockets(url: str) -> Callable[[WebSocketRoute], Awaitable[None]]:
+    """WebSocket handler: page.route() never sees sockets, so close them all here.
+
+    Print pages open no sockets. A same-origin one could not connect anyway: the
+    route handler serves the page itself, and Chrome's Local Network Access check
+    then refuses its loopback sockets (net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS).
+    """
+    page_origin = _url_origin(url)
+
+    async def handle(socket: WebSocketRoute) -> None:
+        shown_url = _redact_draft_token(socket.url)
+        if _url_origin(socket.url) == page_origin:
+            # e.g. the Next.js dev server's hot-reload socket.
+            logger.debug("Closed WebSocket during PDF render: %s", shown_url)
+        else:
+            logger.warning(
+                "Blocked off-origin WebSocket during PDF render: %s", shown_url
+            )
+        await socket.close()
+
+    return handle
+
+
 async def _render_with_browser(
     browser: Browser,
     url: str,
@@ -454,6 +629,16 @@ async def _render_with_browser(
     )
     render_error: BaseException | None = None
     try:
+        await _await_before_deadline(
+            page.route("**/*", _same_origin_only(url, page, work_deadline)),
+            work_deadline,
+            "request filter",
+        )
+        await _await_before_deadline(
+            page.route_web_socket(lambda _url: True, _close_all_sockets(url)),
+            work_deadline,
+            "request filter",
+        )
         return await _render_page_to_pdf(
             page,
             url,
@@ -589,10 +774,16 @@ def _raise_playwright_error(error: PlaywrightError, url: str) -> NoReturn:
             "Command shown for reference; quote the path if it contains spaces: "
             f"{command}"
         ) from error
+    if "Host system is missing dependencies" in error_msg:
+        logger.error("Chromium system dependencies are missing: %s", error_msg)
+        raise PDFRenderError(
+            "Chromium cannot start because system libraries are missing. Run "
+            "`playwright install-deps chromium` (Linux, may need sudo), then retry."
+        ) from error
     if "net::ERR_CONNECTION_REFUSED" in error_msg:
         raise PDFRenderError(
             f"Cannot connect to frontend for PDF generation. "
-            f"Attempted URL: {url}. "
+            f"Attempted URL: {_redact_draft_token(url)}. "
             f"Please ensure: 1) The frontend is running, "
             f"2) The FRONTEND_BASE_URL environment variable in the backend .env file "
             f"matches the URL where your frontend is accessible."
@@ -601,7 +792,11 @@ def _raise_playwright_error(error: PlaywrightError, url: str) -> NoReturn:
     # and a full call log. Log it server-side; return a generic message to the
     # client (CLAUDE.md rule 5 — and it stops the verbose trace from overflowing
     # the client error modal, #811).
-    logger.error("PDF rendering failed for %s: %s", url, error_msg)
+    logger.error(
+        "PDF rendering failed for %s: %s",
+        _redact_draft_token(url),
+        _redact_draft_token(error_msg),
+    )
     raise PDFRenderError(
         "PDF rendering failed. Please try again, or try a simpler resume or a "
         "different template."
@@ -620,7 +815,10 @@ def _loop_supports_subprocess() -> bool:
 
 async def close_pdf_renderer() -> None:
     """Retire cached ownership and give active teardown a bounded drain window."""
-    global _playwright
+    global _playwright, _idle_close
+    if _idle_close is not None:
+        _idle_close.cancel()
+        _idle_close = None
     await _init_lock.acquire()
     try:
         if _browser is not None:
@@ -771,7 +969,7 @@ def _retire_shared_browser(
     """Detach a browser with an unclosed page and retain capacity for teardown."""
     global _browser, _playwright
     if _browser is not browser:
-        return
+        return None
 
     playwright = _playwright
     _browser = None
@@ -799,16 +997,69 @@ def _retire_shared_browser(
     return owner
 
 
+def _restart_idle_countdown() -> None:
+    """Retire the shared browser if no export uses it for the idle period."""
+    global _idle_close
+    if _idle_close is not None:
+        _idle_close.cancel()
+    _idle_close = asyncio.get_running_loop().call_later(
+        _PDF_BROWSER_IDLE_SECONDS, _retire_idle_browser
+    )
+
+
+def _retire_idle_browser() -> None:
+    """Idle-countdown callback: retire the browser unless an export holds it."""
+    global _idle_close
+    _idle_close = None
+    # An export still using or launching the browser restarts the countdown
+    # when it finishes.
+    if _browser is None or _browser in _browser_users or _init_lock.locked():
+        return
+    logger.info("Closing the idle PDF browser")
+    # No export owns this teardown, so a normal close takes no export slot. One
+    # that overruns the cleanup reserve takes a slot until it ends, as stale-browser
+    # retirement does, so hung closes stay bounded. A failed teardown keeps one
+    # through quarantine.
+    owner = _retire_shared_browser(_browser, retain_slot=False)
+    if owner is not None:
+        asyncio.get_running_loop().call_later(
+            _PDF_CLEANUP_RESERVE_SECONDS, _hold_slot_while_unfinished, owner
+        )
+
+
+def _hold_slot_while_unfinished(owner: asyncio.Task[None]) -> None:
+    """Hold a render slot for a teardown still running past its reserve."""
+    if owner.done():
+        return
+    _retain_render_slot_for_cleanup()
+    owner.add_done_callback(lambda _done: _release_render_slot())
+
+
+def _release_slot_when_worker_exits(worker: asyncio.Task[bytes]) -> None:
+    """Done callback: free a detached worker's slot and keep its failure visible."""
+    if not worker.cancelled() and worker.exception() is not None:
+        logger.error("Detached PDF fallback worker failed", exc_info=worker.exception())
+    _release_render_slot()
+
+
 async def _release_slot_after_worker(worker: asyncio.Task[bytes]) -> None:
     """Retain capacity until a non-cancellable thread worker actually exits."""
+    release_now = True
     try:
-        await worker
+        # shield: cancelling this owner must not cancel the worker task, which
+        # would mark it done while its thread keeps rendering.
+        await asyncio.shield(worker)
     except asyncio.CancelledError:
-        return
+        if not worker.done():
+            # The thread is still running: its exit releases the slot.
+            worker.add_done_callback(_release_slot_when_worker_exits)
+            release_now = False
+        raise
     except Exception:
         logger.exception("Detached PDF fallback worker failed")
     finally:
-        _release_render_slot()
+        if release_now:
+            _release_render_slot()
 
 
 def _transfer_slot_to_worker(worker: asyncio.Task[bytes]) -> None:
@@ -827,37 +1078,40 @@ async def _render_on_shared_browser(
     total_deadline: float,
 ) -> bytes:
     """Render once, retrying only when the owned browser disconnected."""
-    browser = await _replace_disconnected_browser(work_deadline, total_deadline)
-    for attempt in range(2):
-        try:
-            users = _acquire_browser_user(browser)
+    try:
+        browser = await _replace_disconnected_browser(work_deadline, total_deadline)
+        for attempt in range(2):
             try:
-                return await _render_with_browser(
-                    browser,
-                    url,
-                    selector,
-                    pdf_format,
-                    pdf_margins,
-                    work_deadline,
-                    total_deadline,
-                )
-            finally:
-                _release_browser_user(browser, users)
-        except PlaywrightError:
-            if attempt == 0 and not _browser_is_connected(browser):
-                browser = await _replace_disconnected_browser(
-                    work_deadline,
-                    total_deadline,
-                )
-                continue
-            raise
-    raise PDFRenderError("PDF renderer failed to recover.")
+                users = _acquire_browser_user(browser)
+                try:
+                    return await _render_with_browser(
+                        browser,
+                        url,
+                        selector,
+                        pdf_format,
+                        pdf_margins,
+                        work_deadline,
+                        total_deadline,
+                    )
+                finally:
+                    _release_browser_user(browser, users)
+            except PlaywrightError:
+                if attempt == 0 and not _browser_is_connected(browser):
+                    browser = await _replace_disconnected_browser(
+                        work_deadline,
+                        total_deadline,
+                    )
+                    continue
+                raise
+        raise PDFRenderError("PDF renderer failed to recover.")
+    finally:
+        _restart_idle_countdown()
 
 
 async def render_resume_pdf(
     url: str,
     page_size: str = "A4",
-    selector: str = ".resume-print",
+    selector: str = f".resume-print, {PRINT_ERROR_SELECTOR}",
     margins: Optional[dict] = None,
 ) -> bytes:
     """Render a URL to PDF bytes.
@@ -865,7 +1119,8 @@ async def render_resume_pdf(
     Args:
         url: The URL to render (print route)
         page_size: Page size format - "A4" or "LETTER"
-        selector: CSS selector to wait for before rendering (default: ".resume-print")
+        selector: CSS selector to wait for before rendering. Include
+            PRINT_ERROR_SELECTOR so a page that cannot load its data fails fast.
         margins: Page margins dict with top/right/bottom/left in mm (applied to every page)
 
     Note:
@@ -922,7 +1177,20 @@ async def render_resume_pdf(
 
         raise PDFRenderError("PDF renderer failed to initialize.")
     except _PDFDeadlineExceeded as error:
-        logger.warning("PDF rendering timed out during %s for %s", error.stage, url)
+        logger.warning(
+            "PDF rendering timed out during %s for %s",
+            error.stage,
+            _redact_draft_token(url),
+        )
+        if error.stage == "resume readiness":
+            # The page loaded but never showed its content (a resume or a cover
+            # letter): the URL most likely reaches another app, so a simpler
+            # document would not help.
+            raise PDFRenderTimeoutError(
+                "PDF rendering timed out: the print page loaded but never showed "
+                "its content. Check that FRONTEND_BASE_URL points at the running "
+                "Resume Matcher frontend."
+            ) from error
         raise PDFRenderTimeoutError(
             "PDF rendering timed out. Please try again, or try a simpler resume."
         ) from error

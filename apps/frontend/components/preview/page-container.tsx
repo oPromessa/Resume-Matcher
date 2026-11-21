@@ -3,6 +3,7 @@
 import React from 'react';
 import { type PageSize, type MarginSettings } from '@/lib/types/template-settings';
 import { PAGE_DIMENSIONS, mmToPx } from '@/lib/constants/page-dimensions';
+import { useTranslations } from '@/lib/i18n';
 
 interface PageContainerProps {
   pageSize: PageSize;
@@ -33,6 +34,7 @@ export function PageContainer({
   contentOffset = 0,
   contentEnd,
 }: PageContainerProps) {
+  const { t } = useTranslations();
   const pageDims = PAGE_DIMENSIONS[pageSize];
   const pageWidthPx = mmToPx(pageDims.width);
   const pageHeightPx = mmToPx(pageDims.height);
@@ -55,7 +57,7 @@ export function PageContainer({
     <div className="relative flex flex-col items-center">
       {/* Page wrapper with scale transform */}
       <div
-        className="relative bg-white border-2 border-black shadow-sw-card origin-top"
+        className="relative bg-white border-2 border-ink shadow-sw-card origin-top"
         style={{
           width: pageWidthPx,
           height: pageHeightPx,
@@ -72,14 +74,14 @@ export function PageContainer({
               left: marginLeftPx,
               width: contentWidth,
               height: maxContentHeight,
-              border: '1px dashed rgba(29, 78, 216, 0.5)',
+              border: '1px dashed color-mix(in srgb, var(--sw-primary) 50%, transparent)',
             }}
           >
             {/* Corner markers */}
-            <div className="absolute -top-1 -left-1 w-2 h-2 border-t border-l border-blue-500" />
-            <div className="absolute -top-1 -right-1 w-2 h-2 border-t border-r border-blue-500" />
-            <div className="absolute -bottom-1 -left-1 w-2 h-2 border-b border-l border-blue-500" />
-            <div className="absolute -bottom-1 -right-1 w-2 h-2 border-b border-r border-blue-500" />
+            <div className="absolute -top-1 -left-1 size-2 border-t border-l border-primary" />
+            <div className="absolute -top-1 -right-1 size-2 border-t border-r border-primary" />
+            <div className="absolute -bottom-1 -left-1 size-2 border-b border-l border-primary" />
+            <div className="absolute -bottom-1 -right-1 size-2 border-b border-r border-primary" />
           </div>
         )}
 
@@ -107,10 +109,10 @@ export function PageContainer({
 
         {/* Page number indicator */}
         <div
-          className="absolute bottom-2 right-3 font-mono text-[10px] text-steel-grey uppercase tracking-wider"
+          className="absolute bottom-2 right-3 font-mono text-xs text-steel uppercase tracking-wider tabular-nums"
           style={{ transform: `scale(${1 / scale})`, transformOrigin: 'bottom right' }}
         >
-          Page {pageNumber} of {totalPages}
+          {t('preview.pageOfTotal', { page: pageNumber, total: totalPages })}
         </div>
       </div>
     </div>

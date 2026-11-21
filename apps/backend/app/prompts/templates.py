@@ -181,6 +181,7 @@ Rules:
 - Normalize date separators: "2020-2021" → "2020 - 2021", "Current"/"Ongoing" → "Present". Do NOT discard months.
 - For ambiguous dates like "3 years experience", infer approximate years from context or use "~YYYY"
 - Flag overlapping dates (concurrent roles) by preserving both, don't merge
+- Copy every skill, tool, framework, programming language and technology the resume lists into additional.technicalSkills, one item each, keeping the original wording. Split comma-separated lists into separate items. Never summarize, merge, shorten or drop skills, however long the list is. Spoken languages (English, Hindi, ...) go in additional.languages, not technicalSkills.
 
 Resume to parse:
 {resume_text}"""
@@ -236,6 +237,9 @@ CRITICAL_TRUTHFULNESS_RULES = {
     ),
     "full": _build_truthfulness_rules(
         "You may expand existing bullet points or add new ones that elaborate on existing work, but DO NOT invent entirely new responsibilities"
+    ),
+    "heavy": _build_truthfulness_rules(
+        "You may restructure every bullet point, rewrite the summary and reorder bullets within a role, but DO NOT invent responsibilities, tools, metrics or outcomes"
     ),
 }
 
@@ -333,6 +337,37 @@ Original Resume:
 Output in this JSON format:
 {schema}"""
 
+IMPROVE_RESUME_PROMPT_HEAVY = """Rewrite this resume for the job. Output ONLY the JSON object, no other text.
+
+{critical_truthfulness_rules}
+
+IMPORTANT: Generate ALL text content (summary, descriptions, skills) in {output_language}.
+Do NOT include personalInfo in your output - it will be preserved from the original resume.
+
+Rules:
+- Rewrite every bullet as Challenge, Action, Result: open with a strong action verb, state what changed because of the work. Keep every fact of the original bullet.
+- Rewrite the summary from scratch as a positioning statement: role identity, years and domain, signature strength, all taken from the resume.
+- You may reorder bullets within a role so the strongest evidence for this job comes first.
+- Keep the same number of bullets in every entry. Do not merge, drop or add bullets.
+- Never invent metrics. When a bullet has no number, state the outcome or scope it already implies.
+- Keep proper nouns (names, company names, locations) unchanged
+- Preserve descriptionStyles arrays and keep them aligned one-to-one with description arrays
+- For customSections: preserve exact structure, item count, titles, subtitles, and years. If an item's description is an empty array [] in the original, keep it empty []. Do NOT generate descriptions for items that had none.
+- Copy the "years" field values EXACTLY as they appear in the original resume (including any month prefixes like "Jan 2020 - Present"). Do not shorten, reformat, or drop months.
+- Do NOT use em dash ("—") anywhere in the writing/output, even if it exists, remove it
+
+Job Description:
+{job_description}
+
+Keywords to emphasize:
+{job_keywords}
+
+Original Resume:
+{original_resume}
+
+Output in this JSON format:
+{schema}"""
+
 IMPROVE_PROMPT_OPTIONS = [
     {
         "id": "nudge",
@@ -349,12 +384,18 @@ IMPROVE_PROMPT_OPTIONS = [
         "label": "Full tailor",
         "description": "Comprehensive tailoring using the job description.",
     },
+    {
+        "id": "heavy",
+        "label": "Heavy rewrite",
+        "description": "Rewrites every bullet and the summary. Bigger edits carry a higher risk of hallucination, so review every line.",
+    },
 ]
 
 IMPROVE_RESUME_PROMPTS = {
     "nudge": IMPROVE_RESUME_PROMPT_NUDGE,
     "keywords": IMPROVE_RESUME_PROMPT_KEYWORDS,
     "full": IMPROVE_RESUME_PROMPT_FULL,
+    "heavy": IMPROVE_RESUME_PROMPT_HEAVY,
 }
 
 DEFAULT_IMPROVE_PROMPT_ID = "keywords"
@@ -362,7 +403,7 @@ DEFAULT_IMPROVE_PROMPT_ID = "keywords"
 # Backward-compatible alias
 IMPROVE_RESUME_PROMPT = IMPROVE_RESUME_PROMPT_FULL
 
-COVER_LETTER_PROMPT = """Write a brief cover letter for this job application.
+COVER_LETTER_PROMPT = """Write a tailored cover letter for this job application.
 
 IMPORTANT: Write in {output_language}.
 
@@ -372,17 +413,27 @@ Job Description:
 Candidate Resume (JSON):
 {resume_data}
 
+Plan silently before writing:
+- Identify the target role, company, and the job's most important requirements.
+- Infer regional conventions from the supplied job description and resume. Use US, UK, or AU/NZ terminology, greeting, and sign-off when the region is clear; otherwise use neutral professional conventions.
+- Infer the employer type and match its tone: conversational and direct for startups/tech, measured for corporate roles, formal and criteria-led for government, personality-forward for creative agencies, and mission-aligned for nonprofits.
+- Select the two or three strongest evidence-backed matches from the resume. Prioritize relevance over impressiveness.
+
 Requirements:
-- 100-150 words maximum
-- 3-4 short paragraphs
-- Opening: Reference ONE specific thing from the job description (product, tech stack, or problem they're solving) - not generic excitement about "the role"
-- Middle: Pick 1-2 qualifications from resume that DIRECTLY match stated requirements, and reframe them in the job's language/terminology where the candidate's proven experience supports it (e.g., if the resume shows "built automated data pipelines" and the job says "ETL," describe that real work as ETL) - prioritize relevance over impressiveness
-- Closing: Simple availability to discuss, no desperate enthusiasm
-- If resume shows career transition, frame the pivot as intentional and relevant
-- Extract company name from job description - do not use placeholders
-- Do NOT invent information not in the resume
-- Tone: Confident peer, not eager applicant
-- Do NOT use em dash ("—") anywhere in the writing/output, even if it exists, remove it
+- Keep the letter under one page, normally 200-300 words, in 3-4 concise paragraphs.
+- Address a named hiring person only when one appears in the supplied inputs; otherwise use "Dear Hiring Manager". Never invent a name.
+- For English letters, use "Kind regards" for AU/NZ; use "Sincerely" or "Kind regards" for US/UK. Localize the greeting and sign-off for other output languages.
+- Opening hook: Explain why this role or its current challenge matters to the candidate, anchored in ONE specific detail from the job description. Never open with "I am writing to express my interest" or generic excitement about "the role."
+- Match paragraph: Connect the selected experience examples directly to stated requirements. Add brief context and measurable results when the resume provides them. Reframe the work in the job's language/terminology where the candidate's proven experience supports it (for example, if the resume shows "built automated data pipelines" and the job says "ETL," describe that real work as ETL).
+- Company-fit paragraph: Reference a specific product, mission, project, customer, culture signal, or challenge stated in the job description and explain why it matters to the candidate. If the inputs contain no such detail, connect to the company's stated goal or role challenge instead of inventing research or using generic flattery.
+- Closing: Include a confident, specific call to action about how the candidate could support the team's stated work. Do not sound desperate.
+- Add context and personality instead of rehashing resume bullets.
+- If the supplied resume clearly indicates a career transition, employment gap, overqualification, or underqualification, address it briefly and honestly using transferable evidence or motivation. Do not speculate about circumstances that are not present.
+- Extract the role and company name from the supplied inputs. Do not output placeholder brackets.
+- Do NOT invent experience, skills, metrics, motivations, company facts, or information not in the supplied resume and job description.
+- Avoid unsupported claims such as "perfect candidate," generic praise such as "innovative company," and weak phrasing such as "I helped with."
+- Tone: Confident peer, factual and specific, calibrated to the employer.
+- Do NOT use an em dash ("—") anywhere in the writing/output; replace it with punctuation appropriate to the language.
 
 Output plain text only. No JSON, no markdown formatting."""
 
@@ -402,6 +453,35 @@ Guidelines:
 - One sentence on strongest matching qualification with a concrete metric if available
 - End with low-friction ask: "Worth a quick chat?" not "I'd love the opportunity to discuss"
 - Tone: How you'd message a former colleague, not a stranger
+- Do NOT include placeholder brackets
+- Do NOT use phrases like "excited about" or "passionate about"
+- Do NOT use em dash ("—") anywhere in the writing/output, even if it exists, remove it
+
+Output plain text only. No JSON, no markdown formatting."""
+
+FOLLOW_UP_EMAIL_PROMPT = """Write a short follow-up email about a job application that has had no reply yet.
+
+IMPORTANT: Write in {output_language}.
+
+Application:
+{application_context}
+
+Job Description:
+{job_description}
+
+Candidate Resume (JSON):
+{resume_data}
+
+Guidelines:
+- Write the Subject line label and greeting in {output_language}, like everything else
+- First line: the word for "Subject" in {output_language}, a colon, and a short subject naming the role
+- Body: 60-120 words
+- Open with a neutral greeting, or greet the hiring contact by name if the job description names one
+- Restate interest in the role, naming the role and company when they are given
+- One sentence on the strongest match between the resume and the job description, with a concrete result if the resume has one
+- Close politely and without pressure: ask whether there is an update on the timeline, or anything else they need
+- Sign off with the candidate's name from the resume. If the resume has no name, end without one
+- Use only facts from the resume and the job description. Do NOT invent contacts, conversations, interviews, dates or metrics
 - Do NOT include placeholder brackets
 - Do NOT use phrases like "excited about" or "passionate about"
 - Do NOT use em dash ("—") anywhere in the writing/output, even if it exists, remove it
@@ -478,15 +558,13 @@ Rules:
 
 Output the title only, nothing else."""
 
-# Alias for backward compatibility
-RESUME_SCHEMA = RESUME_SCHEMA_EXAMPLE
-
 # Diff-based improvement: outputs targeted changes instead of full resume
 
 DIFF_STRATEGY_INSTRUCTIONS = {
     "nudge": "Make minimal edits. Only rephrase where there is a clear match. Do not add new bullet points.",
     "keywords": "Weave in relevant keywords where evidence already exists. You may rephrase bullets but do not add new ones.",
     "full": "Make targeted adjustments. You may rephrase bullets, add verified JD skills, and add new bullets that elaborate on existing work, but do not invent new responsibilities.",
+    "heavy": 'Heavy rewrite. Rewrite every bullet as Challenge, Action, Result and rewrite the summary from scratch, keeping every fact of each original. You may reorder the bullets within an entry (action "reorder" on its description path) so the strongest evidence comes first. Do not add or append bullets and do not invent responsibilities, tools or metrics.',
 }
 
 # Appended to the strategy rule when the harness already chose the bullets (bullet selection).
@@ -576,7 +654,7 @@ RULES:
 PATHS you can target:
 - "summary" — the resume summary text
 - "workExperience[i].description[j]" — a specific bullet (i = entry index, j = bullet index)
-- "workExperience[i].description" — append a new bullet (action: "append")
+- "workExperience[i].description" — append a new bullet (action: "append"), or reorder that entry's bullets (action: "reorder", value = the entry's original bullets copied exactly in the new order; only when the strategy allows reordering)
 - "personalProjects[i].description[j]" — a specific project bullet
 - "personalProjects[i].description" — append a new project bullet (action: "append")
 - "education[i].description" — the education entry's description text (replace only; it is a single string, not a list)

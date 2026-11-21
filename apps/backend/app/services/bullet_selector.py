@@ -87,9 +87,13 @@ def _keep_rows(entry: dict[str, Any], keep: list[int]) -> None:
 def select_bullets(
     data: dict[str, Any],
     scores: dict[BulletKey, float],
-    max_per_entry: int,
+    max_per_entry: int | None,
 ) -> BulletSelection:
-    """Keep the top-N bullets per entry by (score desc, index asc), in original order."""
+    """Keep the top-N bullets per entry by (score desc, index asc), in original order.
+
+    ``max_per_entry=None`` keeps every bullet (scores are still carried over for
+    page fitting).
+    """
     result = copy.deepcopy(data)
     new_scores: dict[BulletKey, float] = {}
     before = 0
@@ -118,8 +122,9 @@ def trim_order(data: dict[str, Any], scores: dict[BulletKey, float]) -> list[Bul
     entry_scores: dict[tuple[str, int], list[float]] = {}
     candidates: list[tuple[int, str, int, int]] = []
     for section_rank, section in enumerate(SELECTABLE_SECTIONS):
-        for entry_index, _entry, description in _entries(data, section):
-            if not description:
+        for entry_index, entry, description in _entries(data, section):
+            # A condensed entry renders as one line, so dropping its bullets saves nothing.
+            if not description or entry.get("condensed"):
                 continue
             counts[(section, entry_index)] = len(description)
             entry_scores[(section, entry_index)] = [
@@ -163,15 +168,20 @@ def drop_bullets(data: dict[str, Any], drops: list[BulletKey]) -> dict[str, Any]
     return result
 
 
-async def fit_to_one_page(
+async def fit_to_page_limit(
     data: dict[str, Any],
     scores: dict[BulletKey, float],
     measure: Callable[[dict[str, Any]], Awaitable[int]],
+    max_pages: int | None = 1,
     max_renders: int = MAX_FIT_RENDERS,
 ) -> FitResult:
-    """Drop the fewest ranked bullets so the rendered draft fits one page.
+    """Drop the fewest ranked bullets so the rendered draft fits ``max_pages``.
+
+    With ``max_pages=None`` (no cap) nothing is dropped; the draft is measured once.
 
     Page count is monotonic in the number of drops, so binary search over k.
+    When even the maximum trim (one bullet per entry) spills over the limit,
+    the draft is returned untrimmed: gutting every entry gains nothing.
     """
     order = trim_order(data, scores)
     renders = 0
@@ -183,20 +193,20 @@ async def fit_to_one_page(
 
     try:
         base_pages = await pages_for(0)
-        if base_pages <= 1:
+        if max_pages is None or base_pages <= max_pages:
             return FitResult(copy.deepcopy(data), "fits", 0, base_pages, renders)
         if not order:
             return FitResult(copy.deepcopy(data), "over", 0, base_pages, renders)
         top = len(order)
         top_pages = await pages_for(top)
-        if top_pages > 1:
-            return FitResult(drop_bullets(data, order), "over", top, top_pages, renders)
+        if top_pages > max_pages:
+            return FitResult(copy.deepcopy(data), "over", 0, base_pages, renders)
         low, high, high_pages = 0, top, top_pages
         try:
             while high - low > 1 and renders < max_renders:
                 mid = (low + high) // 2
                 mid_pages = await pages_for(mid)
-                if mid_pages <= 1:
+                if mid_pages <= max_pages:
                     high, high_pages = mid, mid_pages
                 else:
                     low = mid

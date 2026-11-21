@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -20,15 +20,21 @@ from app import __version__
 from app.ai_budget import operation_error_content
 from app.config import settings
 from app.database import DatabaseBusyError, db
+from app.host_guard import HostGuardMiddleware
 from app.pdf import close_pdf_renderer
 from app.routers import (
+    applications_ai_router,
     applications_router,
+    ats_router,
+    chatgpt_callback_router,
+    chatgpt_router,
     config_router,
     enrichment_router,
     health_router,
     jobs_router,
     resume_wizard_router,
     resumes_router,
+    writing_router,
 )
 from app.routers.resumes import drain_processing_cleanup_tasks
 
@@ -47,6 +53,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan manager."""
     # Startup
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    if settings.database_url:
+        from app.db_url import redact
+
+        logger.info("Using PostgreSQL at %s", redact(settings.database_url))
     # Import a legacy TinyDB database into SQLite if present (idempotent).
     # Fail-fast on error: starting with an empty DB would look like data loss.
     from app.scripts.migrate_tinydb_to_sqlite import migrate as migrate_tinydb
@@ -59,24 +69,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.config import migrate_legacy_keys
 
     migrate_legacy_keys()
+
+    from app.services.queue_worker import queue_manager
+
+    await queue_manager.start()
     # PDF renderer uses lazy initialization - will initialize on first use
-    # await init_pdf_renderer()
     yield
-    # Shutdown - wrap each cleanup in try-except to ensure all resources are released
+    await _shutdown()
+
+
+async def _run_shutdown_step(step: Awaitable[object], error_message: str) -> None:
+    """Run one shutdown step, logging a failure so the next step still runs."""
     try:
-        await drain_processing_cleanup_tasks()
+        await step
     except Exception:
-        logger.exception("Error draining processing cleanup")
+        logger.exception(error_message)
+
+
+async def _shutdown() -> None:
+    """Release every resource, in order.
+
+    Each step runs even if an earlier one fails or shutdown is cancelled; a
+    cancellation still propagates once every step has run.
+    """
+    from app.services.queue_worker import queue_manager
 
     try:
-        await close_pdf_renderer()
-    except Exception as e:
-        logger.error(f"Error closing PDF renderer: {e}")
-
-    try:
-        await db.close()
-    except Exception as e:
-        logger.error(f"Error closing database: {e}")
+        await _run_shutdown_step(
+            queue_manager.stop(), "Error stopping the tailoring queue"
+        )
+    finally:
+        try:
+            await _run_shutdown_step(
+                drain_processing_cleanup_tasks(), "Error draining processing cleanup"
+            )
+        finally:
+            try:
+                await _run_shutdown_step(
+                    close_pdf_renderer(), "Error closing PDF renderer"
+                )
+            finally:
+                await _run_shutdown_step(db.close(), "Error closing database")
 
 
 app = FastAPI(
@@ -109,6 +142,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Added last so it runs first: reject requests for hosts this app does not serve.
+app.add_middleware(HostGuardMiddleware, allowed_hosts=settings.effective_allowed_hosts)
 
 # Include routers
 app.include_router(health_router, prefix="/api/v1")
@@ -117,7 +152,13 @@ app.include_router(resumes_router, prefix="/api/v1")
 app.include_router(jobs_router, prefix="/api/v1")
 app.include_router(enrichment_router, prefix="/api/v1")
 app.include_router(applications_router, prefix="/api/v1")
+app.include_router(applications_ai_router, prefix="/api/v1")
 app.include_router(resume_wizard_router, prefix="/api/v1")
+app.include_router(ats_router, prefix="/api/v1")
+app.include_router(chatgpt_router, prefix="/api/v1")
+app.include_router(writing_router, prefix="/api/v1")
+# OpenAI redirects to 127.0.0.1:<port>/auth/callback; the path is fixed.
+app.include_router(chatgpt_callback_router)
 
 
 @app.get("/")

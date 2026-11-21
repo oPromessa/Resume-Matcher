@@ -188,16 +188,13 @@ else
     status "Data directory exists: $DATA_DIR"
 fi
 
-# Check for Playwright browsers
-info "Checking Playwright browsers..."
-if [ -d "/root/.cache/ms-playwright" ] || [ -d "/home/appuser/.cache/ms-playwright" ]; then
-    status "Playwright browsers found"
+# Check for Chromium (Debian's package, installed at build time; app/pdf.py uses it)
+info "Checking Chromium for PDF export..."
+if command -v chromium > /dev/null 2>&1; then
+    status "$(chromium --version 2> /dev/null || echo 'Chromium') found"
 else
-    warn "Installing Playwright Chromium (this may take a moment)..."
-    python -m playwright install chromium || {
-        warn "Playwright install failed — PDF export may not work"
-    }
-    status "Playwright setup complete"
+    error "Chromium is missing from this image — PDF export will not work."
+    error "Rebuild the image (e.g. 'docker compose build --no-cache') to install it."
 fi
 
 # Start backend
@@ -205,7 +202,7 @@ echo ""
 info "Starting backend server on internal port ${BACKEND_PORT}..."
 cd /app/backend
 trap '' SIGTERM SIGINT SIGQUIT
-python -m uvicorn app.main:app --host 0.0.0.0 --port "${BACKEND_PORT}" --log-level "${UVICORN_LOG_LEVEL}" &
+python -m uvicorn app.main:app --host 127.0.0.1 --port "${BACKEND_PORT}" --log-level "${UVICORN_LOG_LEVEL}" &
 BACKEND_PID=$!
 trap cleanup SIGTERM SIGINT SIGQUIT
 

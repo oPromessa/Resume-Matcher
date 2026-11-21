@@ -56,6 +56,22 @@ class TestLlmConfig:
     @patch("app.routers.config._log_llm_health_check", new_callable=AsyncMock)
     @patch("app.routers.config._save_config")
     @patch("app.routers.config._load_config")
+    async def test_put_llm_config_lowercases_the_provider(
+        self, mock_load, mock_save, mock_log_health, client
+    ):
+        mock_load.return_value = {}
+        async with client:
+            resp = await client.put(
+                "/api/v1/config/llm-api-key",
+                json={"provider": "Anthropic", "model": "claude-haiku-4-5-20251001"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["provider"] == "anthropic"
+        assert mock_save.call_args.args[0]["provider"] == "anthropic"
+
+    @patch("app.routers.config._log_llm_health_check", new_callable=AsyncMock)
+    @patch("app.routers.config._save_config")
+    @patch("app.routers.config._load_config")
     async def test_put_llm_config_does_not_persist_api_key(
         self, mock_load, mock_save, mock_log_health, client
     ):
@@ -628,7 +644,13 @@ class TestRequiresBaseUrlValidation:
         client: AsyncClient,
         tmp_path: Path,
         backend_test_data_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from app.config import settings
+
+        # No key resolves here: a developer's LLM_API_KEY (.env) would otherwise
+        # have to be proven before it may move to the new base (422).
+        monkeypatch.setattr(settings, "llm_api_key", "")
         sentinel_path = backend_test_data_dir / "config.json"
         sentinel_path.write_text('{"sentinel": "developer-state"}')
         async with client:
@@ -642,7 +664,10 @@ class TestRequiresBaseUrlValidation:
             )
 
         assert resp.status_code == 200
-        assert json.loads((tmp_path / "data" / "config.json").read_text()) == {
+        saved = json.loads((tmp_path / "data" / "config.json").read_text())
+        # The custom base is bound to the key confirmed for it (none here).
+        assert len(saved.pop("api_base_key_binding")) == 64
+        assert saved == {
             "provider": "azure_foundry",
             "model": "gpt-5-mini",
             "api_base": "https://example.services.ai.azure.com/openai/v1/responses",

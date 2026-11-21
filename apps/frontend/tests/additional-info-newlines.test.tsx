@@ -41,6 +41,16 @@ describe('AdditionalForm newline handling (issue #763)', () => {
   });
 });
 
+describe('AdditionalForm skill grouping hint', () => {
+  it('describes the Technical Skills box with the grouping hint', () => {
+    render(<AdditionalForm data={{}} onChange={vi.fn()} />);
+
+    const textarea = screen.getByLabelText('resume.additional.technicalSkills');
+    const hint = screen.getByText('builder.additionalForm.technicalSkillsHint');
+    expect(textarea).toHaveAttribute('aria-describedby', hint.id);
+  });
+});
+
 describe('ResumeSingleColumn filters blank entries (issue #763)', () => {
   it('does not render empty/whitespace-only additional entries', () => {
     const data: ResumeData = {
@@ -52,8 +62,10 @@ describe('ResumeSingleColumn filters blank entries (issue #763)', () => {
 
     render(<ResumeSingleColumn data={data} />);
 
-    // Blank entries must not produce stray separators in the joined output.
-    expect(screen.getByText('React, TypeScript')).toBeInTheDocument();
-    expect(screen.queryByText(/React, , /)).not.toBeInTheDocument();
+    // Blank entries must not produce empty tags or stray separators (#875 renders
+    // each item as its own tag, joined by a separator in the text).
+    const tagList = screen.getByText('React').parentElement;
+    expect(tagList?.children).toHaveLength(3); // React, separator, TypeScript
+    expect(tagList?.textContent).toBe('React, TypeScript');
   });
 });

@@ -7,15 +7,23 @@ import type {
 } from '@/components/dashboard/resume-component';
 import { getSortedSections } from '@/lib/utils/section-helpers';
 import { formatDateRange } from '@/lib/utils';
+import { groupSkills } from '@/lib/utils/skill-groups';
 import { DynamicResumeSection } from './dynamic-resume-section';
 import { DescriptionList } from './description-list';
+import { TagList } from './tag-list';
+import { EarlierExperience, splitCondensed } from './earlier-experience';
+import { RESUME_SECTION, RESUME_SECTION_TITLE, resumeItem } from './page-break-attrs';
 import baseStyles from './styles/_base.module.css';
 import styles from './styles/swiss-single.module.css';
+import modernStyles from './styles/modern.module.css';
 
 interface ResumeSingleColumnProps {
+  earlierExperienceLabel?: string;
   data: ResumeData;
   showContactIcons?: boolean;
   additionalSectionLabels?: Partial<AdditionalSectionLabels>;
+  /** Modern variant: accent-coloured section titles and a name underline. */
+  accent?: boolean;
 }
 
 /**
@@ -23,6 +31,7 @@ interface ResumeSingleColumnProps {
  *
  * Traditional full-width layout with sections stacked vertically.
  * Best for detailed experience descriptions and maximum content density.
+ * With `accent`, renders the Modern template (see resume-modern.tsx).
  *
  * Section order: Determined by sectionMeta ordering
  */
@@ -30,8 +39,13 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
   data,
   showContactIcons = false,
   additionalSectionLabels,
+  earlierExperienceLabel,
+  accent = false,
 }) => {
   const { personalInfo, summary, workExperience, education, personalProjects, additional } = data;
+  const sectionTitleClass = accent
+    ? modernStyles['section-title-accent']
+    : baseStyles['resume-section-title'];
 
   // Get sorted visible sections
   const sortedSections = getSortedSections(data);
@@ -99,8 +113,10 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
       case 'summary':
         if (!summary) return null;
         return (
-          <div key={section.id} className={baseStyles['resume-section']}>
-            <h3 className={baseStyles['resume-section-title']}>{section.displayName}</h3>
+          <div key={section.id} {...RESUME_SECTION} className={baseStyles['resume-section']}>
+            <h3 {...RESUME_SECTION_TITLE} className={sectionTitleClass}>
+              {section.displayName}
+            </h3>
             <p className={`text-justify ${baseStyles['resume-text']}`}>{summary}</p>
           </div>
         );
@@ -108,11 +124,17 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
       case 'workExperience':
         if (!workExperience || workExperience.length === 0) return null;
         return (
-          <div key={section.id} className={baseStyles['resume-section']}>
-            <h3 className={baseStyles['resume-section-title']}>{section.displayName}</h3>
+          <div key={section.id} {...RESUME_SECTION} className={baseStyles['resume-section']}>
+            <h3 {...RESUME_SECTION_TITLE} className={sectionTitleClass}>
+              {section.displayName}
+            </h3>
             <div className={baseStyles['resume-items']}>
-              {workExperience.map((exp) => (
-                <div key={exp.id} className={baseStyles['resume-item']}>
+              {splitCondensed(workExperience).full.map((exp) => (
+                <div
+                  key={exp.id}
+                  {...resumeItem(exp.description)}
+                  className={baseStyles['resume-item']}
+                >
                   <div
                     className={`flex justify-between items-baseline ${baseStyles['resume-row-tight']}`}
                   >
@@ -130,6 +152,12 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
                   <DescriptionList items={exp.description} styles={exp.descriptionStyles} />
                 </div>
               ))}
+              {splitCondensed(workExperience).condensed.length > 0 && (
+                <EarlierExperience
+                  items={splitCondensed(workExperience).condensed}
+                  label={earlierExperienceLabel}
+                />
+              )}
             </div>
           </div>
         );
@@ -137,11 +165,17 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
       case 'personalProjects':
         if (!personalProjects || personalProjects.length === 0) return null;
         return (
-          <div key={section.id} className={baseStyles['resume-section']}>
-            <h3 className={baseStyles['resume-section-title']}>{section.displayName}</h3>
+          <div key={section.id} {...RESUME_SECTION} className={baseStyles['resume-section']}>
+            <h3 {...RESUME_SECTION_TITLE} className={sectionTitleClass}>
+              {section.displayName}
+            </h3>
             <div className={baseStyles['resume-items']}>
               {personalProjects.map((project) => (
-                <div key={project.id} className={baseStyles['resume-item']}>
+                <div
+                  key={project.id}
+                  {...resumeItem(project.description)}
+                  className={baseStyles['resume-item']}
+                >
                   <div
                     className={`flex justify-between items-baseline ${baseStyles['resume-row-tight']}`}
                   >
@@ -211,11 +245,13 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
       case 'education':
         if (!education || education.length === 0) return null;
         return (
-          <div key={section.id} className={baseStyles['resume-section']}>
-            <h3 className={baseStyles['resume-section-title']}>{section.displayName}</h3>
+          <div key={section.id} {...RESUME_SECTION} className={baseStyles['resume-section']}>
+            <h3 {...RESUME_SECTION_TITLE} className={sectionTitleClass}>
+              {section.displayName}
+            </h3>
             <div className={baseStyles['resume-items']}>
               {education.map((edu) => (
-                <div key={edu.id} className={baseStyles['resume-item']}>
+                <div key={edu.id} {...resumeItem()} className={baseStyles['resume-item']}>
                   <div
                     className={`flex justify-between items-baseline ${baseStyles['resume-row-tight']}`}
                   >
@@ -246,25 +282,34 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
             additional={additional}
             displayName={section.displayName}
             labels={additionalSectionLabels}
+            titleClassName={sectionTitleClass}
           />
         );
 
       default:
         // Custom section - render using DynamicResumeSection
         if (!section.isDefault) {
-          return <DynamicResumeSection key={section.id} sectionMeta={section} resumeData={data} />;
+          return (
+            <DynamicResumeSection
+              key={section.id}
+              sectionMeta={section}
+              resumeData={data}
+              titleClassName={sectionTitleClass}
+              subtitleClassName={accent ? baseStyles['resume-meta'] : undefined}
+            />
+          );
         }
         return null;
     }
   };
 
   return (
-    <div className={styles.container}>
+    <div className={accent ? modernStyles.container : styles.container}>
       {/* Header Section - Centered Layout (always first) */}
       {personalInfo && (
         <header
-          className={`text-center ${baseStyles['resume-header']} border-b`}
-          style={{ borderColor: 'var(--resume-border-primary)' }}
+          className={`text-center ${baseStyles['resume-header']}${accent ? '' : ' border-b'}`}
+          style={accent ? undefined : { borderColor: 'var(--resume-border-primary)' }}
         >
           {/* Name - Centered */}
           {personalInfo.name && (
@@ -273,10 +318,13 @@ export const ResumeSingleColumn: React.FC<ResumeSingleColumnProps> = ({
             </h1>
           )}
 
+          {/* Decorative accent underline under name */}
+          {accent && <div className={modernStyles['name-underline']} aria-hidden="true" />}
+
           {/* Title - Centered, below name */}
           {personalInfo.title && (
             <h2
-              className={`${baseStyles['resume-title']} ${baseStyles['resume-meta']} tracking-wide uppercase mb-3`}
+              className={`${baseStyles['resume-title']} ${baseStyles['resume-meta']} tracking-wide uppercase ${accent ? 'mt-3 ' : ''}mb-3`}
             >
               {personalInfo.title}
             </h2>
@@ -336,7 +384,8 @@ const AdditionalSection: React.FC<{
   additional: ResumeData['additional'];
   displayName?: string;
   labels?: Partial<AdditionalSectionLabels>;
-}> = ({ additional, displayName = 'Skills & Awards', labels }) => {
+  titleClassName: string;
+}> = ({ additional, displayName = 'Skills & Awards', labels, titleClassName }) => {
   if (!additional) return null;
 
   const {
@@ -348,9 +397,8 @@ const AdditionalSection: React.FC<{
 
   // Drop blank/whitespace-only entries so empty lines (e.g. from editing in the
   // builder) never render in the resume or PDF (issue #763).
-  const technicalSkills = rawTechnicalSkills.filter(
-    (item): item is string => typeof item === 'string' && item.trim() !== ''
-  );
+  // "Label: a, b" lines and "---" breaks lay the skills out in rows (see groupSkills).
+  const skillRows = groupSkills(rawTechnicalSkills);
   const languages = rawLanguages.filter(
     (item): item is string => typeof item === 'string' && item.trim() !== ''
   );
@@ -369,7 +417,7 @@ const AdditionalSection: React.FC<{
   };
 
   const hasContent =
-    technicalSkills.length > 0 ||
+    skillRows.length > 0 ||
     languages.length > 0 ||
     certificationsTraining.length > 0 ||
     awards.length > 0;
@@ -377,31 +425,43 @@ const AdditionalSection: React.FC<{
   if (!hasContent) return null;
 
   return (
-    <div className={baseStyles['resume-section']}>
-      <h3 className={baseStyles['resume-section-title']}>{displayName}</h3>
+    <div {...RESUME_SECTION} className={baseStyles['resume-section']}>
+      <h3 {...RESUME_SECTION_TITLE} className={titleClassName}>
+        {displayName}
+      </h3>
       <div className={`${baseStyles['resume-stack']} ${baseStyles['resume-text-sm']}`}>
-        {technicalSkills.length > 0 && (
-          <div className="flex">
-            <span className="font-bold w-32 shrink-0">{mergedLabels.technicalSkills}</span>
-            <span>{technicalSkills.join(', ')}</span>
+        {/* One page-break unit per skill row; only the first carries the label. */}
+        {skillRows.map((row, index) => (
+          <div key={index} {...resumeItem()} className="flex items-baseline">
+            <span className="font-bold w-32 shrink-0">
+              {index === 0 ? mergedLabels.technicalSkills : null}
+            </span>
+            {row.label ? (
+              <span className="min-w-0">
+                <span className="font-bold">{row.label}: </span>
+                <TagList items={row.items} />
+              </span>
+            ) : (
+              <TagList items={row.items} />
+            )}
           </div>
-        )}
+        ))}
         {languages.length > 0 && (
-          <div className="flex">
+          <div {...resumeItem()} className="flex items-baseline">
             <span className="font-bold w-32 shrink-0">{mergedLabels.languages}</span>
-            <span>{languages.join(', ')}</span>
+            <TagList items={languages} />
           </div>
         )}
         {certificationsTraining.length > 0 && (
-          <div className="flex">
+          <div {...resumeItem()} className="flex items-baseline">
             <span className="font-bold w-32 shrink-0">{mergedLabels.certifications}</span>
-            <span>{certificationsTraining.join(', ')}</span>
+            <TagList items={certificationsTraining} />
           </div>
         )}
         {awards.length > 0 && (
-          <div className="flex">
+          <div {...resumeItem()} className="flex items-baseline">
             <span className="font-bold w-32 shrink-0">{mergedLabels.awards}</span>
-            <span>{awards.join(', ')}</span>
+            <TagList items={awards} />
           </div>
         )}
       </div>

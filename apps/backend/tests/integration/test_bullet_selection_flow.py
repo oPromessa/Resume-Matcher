@@ -743,6 +743,51 @@ async def test_rewritten_condensed_bullet_confirms(
     assert saved["processed_data"]["workExperience"][0]["description"] == expected
 
 
+async def _master_with_condensed_old_role(
+    isolated_db: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = _master_data()
+    data["workExperience"].append(
+        {
+            "id": 2,
+            "title": "Systems Analyst",
+            "company": "Initech",
+            "years": "2004 - 2008",
+            "description": ["Maintained the nightly batch jobs"],
+            "condensed": True,
+        }
+    )
+    data = ResumeData.model_validate(data).model_dump()
+    master = await isolated_db.create_resume_atomic_master(
+        content=json.dumps(data),
+        content_type="json",
+        filename="master.json",
+        processed_data=data,
+        processing_status="ready",
+    )
+    job = await isolated_db.create_job(
+        "Backend Engineer at Example: Python and Kubernetes", master["resume_id"]
+    )
+    return master, job
+
+
+async def test_condensed_role_flag_survives_tailoring_and_confirm(
+    client: AsyncClient, isolated_db: Any
+) -> None:
+    master, job = await _master_with_condensed_old_role(isolated_db)
+    data = await _selection_preview(client, master, job, ImproveDiffResult(changes=[]))
+    work = data["resume_preview"]["workExperience"]
+    assert [(e["id"], e["condensed"]) for e in work] == [(1, False), (2, True)]
+
+    confirm = await _confirm(client, master, job, data)
+    assert confirm.status_code == 200, confirm.text
+    saved = await isolated_db.get_resume(confirm.json()["data"]["resume_id"])
+    assert [e["condensed"] for e in saved["processed_data"]["workExperience"]] == [
+        False,
+        True,
+    ]
+
+
 CJK_BULLETS = [
     "负责设计并实现高并发的分布式支付系统",
     "主导数据库性能优化项目",
@@ -916,3 +961,196 @@ async def test_legacy_preview_registers_no_source_snapshot(
     async with isolated_db._session() as session:
         row = await session.get(TailoringPreview, res.json()["data"]["preview_id"])
     assert row is not None and row.source_data is None
+
+
+def _bullet_total(resume: dict[str, Any]) -> int:
+    return sum(
+        len(e["description"])
+        for e in resume["workExperience"] + resume["personalProjects"]
+    )
+
+
+async def test_preview_with_two_page_limit_keeps_a_two_page_master_whole(
+    client: AsyncClient,
+    master: dict[str, Any],
+    job: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def measure(data: dict[str, Any], fit: Any) -> int:
+        return 2  # the full master renders on two pages
+
+    monkeypatch.setattr(tailor_selection, "measure_page_count", measure)
+    res = await client.post(
+        "/api/v1/resumes/improve/preview",
+        json={
+            "resume_id": master["resume_id"],
+            "job_id": job["job_id"],
+            "max_pages": 2,
+            "page_fit": {},
+        },
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    sel = data["bullet_selection"]
+    assert sel["page_fit"] == "fits"
+    assert sel["max_pages"] == 2
+    assert sel["max_per_entry"] is None
+    assert sel["bullets_before"] == sel["bullets_after"] == 10
+    assert _bullet_total(data["resume_preview"]) == 10
+    assert tailor_selection.PAGE_FIT_FINAL_OVER_WARNING not in data["warnings"]
+
+    confirm = await _confirm(client, master, job, data)
+    assert confirm.status_code == 200, confirm.text
+
+
+async def test_preview_over_the_limit_keeps_selected_bullets(
+    client: AsyncClient,
+    master: dict[str, Any],
+    job: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def measure(data: dict[str, Any], fit: Any) -> int:
+        return 3  # never fits two pages, whatever is dropped
+
+    monkeypatch.setattr(tailor_selection, "measure_page_count", measure)
+    res = await client.post(
+        "/api/v1/resumes/improve/preview",
+        json={
+            "resume_id": master["resume_id"],
+            "job_id": job["job_id"],
+            "max_bullets_per_entry": 3,
+            "max_pages": 2,
+            "page_fit": {},
+        },
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    sel = data["bullet_selection"]
+    assert (sel["page_fit"], sel["trimmed_for_fit"]) == ("over", 0)
+    assert sel["bullets_after"] == 6
+    assert data["resume_preview"]["workExperience"][0]["description"] == CONDENSED_WORK
+    assert tailor_selection.PAGE_FIT_OVER_WARNING in data["warnings"]
+
+
+async def test_final_check_compares_against_the_page_limit(
+    client: AsyncClient,
+    master: dict[str, Any],
+    job: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    async def measure(data: dict[str, Any], fit: Any) -> int:
+        calls.append(1)
+        return 2 if len(calls) == 1 else 3  # fits two pages, rewrite spills to three
+
+    monkeypatch.setattr(tailor_selection, "measure_page_count", measure)
+    res = await client.post(
+        "/api/v1/resumes/improve/preview",
+        json={
+            "resume_id": master["resume_id"],
+            "job_id": job["job_id"],
+            "max_pages": 2,
+            "page_fit": {},
+        },
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["bullet_selection"]["final_pages"] == 3
+    assert tailor_selection.PAGE_FIT_FINAL_OVER_WARNING in data["warnings"]
+
+
+async def test_preview_in_cv_mode_reports_pages_without_a_page_limit(
+    client: AsyncClient,
+    master: dict[str, Any],
+    job: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    measured: list[int] = []
+
+    async def measure(data: dict[str, Any], fit: Any) -> int:
+        measured.append(1)
+        return 3 if len(measured) == 1 else 4  # a CV runs long and the rewrite longer
+
+    monkeypatch.setattr(tailor_selection, "measure_page_count", measure)
+    res = await client.post(
+        "/api/v1/resumes/improve/preview",
+        json={
+            "resume_id": master["resume_id"],
+            "job_id": job["job_id"],
+            "max_pages": 2,
+            "page_fit": {"cv_mode": True},
+        },
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    sel = data["bullet_selection"]
+    assert (sel["page_fit"], sel["trimmed_for_fit"], sel["max_pages"]) == (
+        "fits",
+        0,
+        None,
+    )
+    assert sel["bullets_before"] == sel["bullets_after"] == 10
+    assert (sel["final_pages"], sel["final_check"]) == (4, "ok")
+    assert tailor_selection.PAGE_FIT_OVER_WARNING not in data["warnings"]
+    assert tailor_selection.PAGE_FIT_FINAL_OVER_WARNING not in data["warnings"]
+
+
+@pytest.mark.parametrize("max_pages", [0, 6])
+async def test_preview_rejects_out_of_range_page_limit(
+    client: AsyncClient, master: dict[str, Any], job: dict[str, Any], max_pages: int
+) -> None:
+    res = await client.post(
+        "/api/v1/resumes/improve/preview",
+        json={
+            "resume_id": master["resume_id"],
+            "job_id": job["job_id"],
+            "max_pages": max_pages,
+            "page_fit": {},
+        },
+    )
+    assert res.status_code == 422
+
+
+async def test_confirm_saves_the_ats_score_as_last_calculated(
+    client: AsyncClient,
+    master: dict[str, Any],
+    job: dict[str, Any],
+) -> None:
+    preview = await client.post(
+        "/api/v1/resumes/improve/preview",
+        json={"resume_id": master["resume_id"], "job_id": job["job_id"]},
+    )
+    assert preview.status_code == 200, preview.text
+    confirm = await _confirm(client, master, job, preview.json()["data"])
+    assert confirm.status_code == 200, confirm.text
+    tailored_id = confirm.json()["data"]["resume_id"]
+
+    res = await client.get(f"/api/v1/resumes/{tailored_id}/ats-score")
+
+    assert res.status_code == 200, res.text
+    record = res.json()
+    assert record["calculated_at"]
+    assert 0 <= record["score"]["overall_score"] <= 100
+
+
+async def test_confirmed_score_matches_the_preview_score(
+    client: AsyncClient,
+    master: dict[str, Any],
+    job: dict[str, Any],
+) -> None:
+    preview = await client.post(
+        "/api/v1/resumes/improve/preview",
+        json={"resume_id": master["resume_id"], "job_id": job["job_id"]},
+    )
+    assert preview.status_code == 200, preview.text
+    previewed = preview.json()["data"]["ats_score"]
+    confirm = await _confirm(client, master, job, preview.json()["data"])
+    assert confirm.status_code == 200, confirm.text
+
+    saved = await client.get(
+        f"/api/v1/resumes/{confirm.json()['data']['resume_id']}/ats-score"
+    )
+
+    assert saved.json()["score"]["overall_score"] == previewed["overall_score"]
+    assert saved.json()["score"]["sub_scores"] == previewed["sub_scores"]

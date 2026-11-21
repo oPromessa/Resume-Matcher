@@ -7,6 +7,9 @@ import {
   ResumeLatex,
   ResumeClean,
   ResumeVivid,
+  ResumeVividSingle,
+  ResumeModernDeedy,
+  ResumeDeedy,
 } from '@/components/resume';
 import {
   type TemplateSettings,
@@ -15,6 +18,32 @@ import {
   settingsToCssVars,
 } from '@/lib/types/template-settings';
 import baseStyles from '@/components/resume/styles/_base.module.css';
+// The Serif, Sans and Mono faces (lib/types/template-settings.ts), one file per weight
+// the templates use. The preview renders in the reader's browser and the PDF in the
+// server's Chromium, which have different local fonts, so both load these files to
+// wrap lines and break pages the same way. Static on purpose: Chromium writes variable
+// fonts into PDFs as Type 3 fonts, which space letters unevenly ("RESUM EN") in the
+// page and in the extracted text an ATS reads. next/font/google only serves these
+// families as variable fonts.
+import '@fontsource/noto-sans/300.css';
+import '@fontsource/noto-sans/400.css';
+import '@fontsource/noto-sans/600.css';
+import '@fontsource/noto-sans/700.css';
+import '@fontsource/noto-sans/800.css';
+import '@fontsource/noto-sans/400-italic.css';
+import '@fontsource/noto-sans/700-italic.css';
+import '@fontsource/noto-serif/300.css';
+import '@fontsource/noto-serif/400.css';
+import '@fontsource/noto-serif/600.css';
+import '@fontsource/noto-serif/700.css';
+import '@fontsource/noto-serif/800.css';
+import '@fontsource/noto-serif/400-italic.css';
+import '@fontsource/noto-serif/700-italic.css';
+import '@fontsource/noto-sans-mono/300.css';
+import '@fontsource/noto-sans-mono/400.css';
+import '@fontsource/noto-sans-mono/600.css';
+import '@fontsource/noto-sans-mono/700.css';
+import '@fontsource/noto-sans-mono/800.css';
 
 export interface PersonalInfo {
   name?: string;
@@ -28,6 +57,7 @@ export interface PersonalInfo {
 }
 
 export interface Experience {
+  condensed?: boolean;
   id: number;
   title?: string;
   company?: string;
@@ -80,6 +110,7 @@ export interface ResumeSectionHeadings {
   languages: string;
   awards: string;
   links: string;
+  earlierExperience?: string;
 }
 
 export interface ResumeFallbackLabels {
@@ -190,6 +221,7 @@ const Resume: React.FC<ResumeProps> = ({
     >
       {mergedSettings.template === 'swiss-single' && (
         <ResumeSingleColumn
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
           data={resumeData}
           showContactIcons={mergedSettings.showContactIcons}
           additionalSectionLabels={additionalSectionLabels}
@@ -197,6 +229,7 @@ const Resume: React.FC<ResumeProps> = ({
       )}
       {mergedSettings.template === 'swiss-two-column' && (
         <ResumeTwoColumn
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
           data={resumeData}
           showContactIcons={mergedSettings.showContactIcons}
           sectionHeadings={sectionHeadings}
@@ -204,6 +237,7 @@ const Resume: React.FC<ResumeProps> = ({
       )}
       {mergedSettings.template === 'modern' && (
         <ResumeModern
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
           data={resumeData}
           showContactIcons={mergedSettings.showContactIcons}
           additionalSectionLabels={additionalSectionLabels}
@@ -211,6 +245,7 @@ const Resume: React.FC<ResumeProps> = ({
       )}
       {mergedSettings.template === 'modern-two-column' && (
         <ResumeModernTwoColumn
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
           data={resumeData}
           showContactIcons={mergedSettings.showContactIcons}
           sectionHeadings={sectionHeadings}
@@ -219,6 +254,7 @@ const Resume: React.FC<ResumeProps> = ({
       )}
       {mergedSettings.template === 'latex' && (
         <ResumeLatex
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
           data={resumeData}
           showContactIcons={mergedSettings.showContactIcons}
           additionalSectionLabels={additionalSectionLabels}
@@ -226,6 +262,7 @@ const Resume: React.FC<ResumeProps> = ({
       )}
       {mergedSettings.template === 'clean' && (
         <ResumeClean
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
           data={resumeData}
           showContactIcons={mergedSettings.showContactIcons}
           additionalSectionLabels={additionalSectionLabels}
@@ -233,9 +270,36 @@ const Resume: React.FC<ResumeProps> = ({
       )}
       {mergedSettings.template === 'vivid' && (
         <ResumeVivid
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
           data={resumeData}
           showContactIcons={mergedSettings.showContactIcons}
           sectionHeadings={sectionHeadings}
+          fallbackLabels={fallbackLabels}
+        />
+      )}
+      {mergedSettings.template === 'vivid-single' && (
+        <ResumeVividSingle
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
+          data={resumeData}
+          showContactIcons={mergedSettings.showContactIcons}
+          sectionHeadings={sectionHeadings}
+          fallbackLabels={fallbackLabels}
+        />
+      )}
+      {mergedSettings.template === 'modern-deedy' && (
+        <ResumeModernDeedy
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
+          data={resumeData}
+          showContactIcons={mergedSettings.showContactIcons}
+          additionalSectionLabels={additionalSectionLabels}
+        />
+      )}
+      {mergedSettings.template === 'deedy' && (
+        <ResumeDeedy
+          earlierExperienceLabel={sectionHeadings?.earlierExperience}
+          data={resumeData}
+          sectionHeadings={sectionHeadings}
+          additionalSectionLabels={additionalSectionLabels}
           fallbackLabels={fallbackLabels}
         />
       )}

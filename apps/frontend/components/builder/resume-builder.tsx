@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useState, useEffect, Suspense, useCallback, useMemo, useRef } from 'react';
-import Image from 'next/image';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { type ResumeData } from '@/components/dashboard/resume-component';
 import { ResumeForm } from './resume-form';
@@ -12,20 +11,23 @@ import { CoverLetterPreview } from './cover-letter-preview';
 import { OutreachPreview } from './outreach-preview';
 import { GeneratePrompt } from './generate-prompt';
 import { InterviewPrepView } from './interview-prep-view';
+import { CommunityLinks } from '@/components/common/community-links';
 import { Button } from '@/components/ui/button';
 import { RetroTabs } from '@/components/ui/retro-tabs';
+import { PageHeader } from '@/components/ui/page-header';
+import { PanelHeader } from '@/components/ui/panel-header';
+import { StatusIndicator } from '@/components/ui/status-indicator';
+import { EmptyState } from '@/components/ui/empty-state';
+import { Alert } from '@/components/ui/alert';
 import { ConfirmDialog, type ConfirmDialogProps } from '@/components/ui/confirm-dialog';
+import { toast } from '@/components/ui/toaster';
 import {
-  Download,
-  Save,
-  AlertTriangle,
+  DownloadSimple,
+  FloppyDisk,
   ArrowLeft,
-  RotateCcw,
-  Copy,
-  Check,
-  Sparkles,
-  Loader2,
-} from 'lucide-react';
+  ArrowCounterClockwise,
+  SpinnerGap,
+} from '@phosphor-icons/react';
 import {
   useResumePreview,
   type InterviewPrepData,
@@ -44,16 +46,16 @@ import {
   generateOutreachMessage,
   generateInterviewPrep,
   fetchJobDescription,
+  updateResumeTemplateSettings,
 } from '@/lib/api/resume';
 import { JDComparisonView } from './jd-comparison-view';
+import { AtsCheckView } from './ats-check-view';
+import { WritingPanel } from './writing-panel';
+import { AtsScorePanel } from './ats-score-panel';
 import { RegenerateWizard } from './regenerate-wizard';
 import { useRegenerateWizard } from '@/hooks/use-regenerate-wizard';
 import { useTranslations } from '@/lib/i18n';
-import { type TemplateSettings } from '@/lib/types/template-settings';
-import {
-  TEMPLATE_SETTINGS_STORAGE_KEY,
-  readStoredTemplateSettings,
-} from '@/lib/utils/stored-template-settings';
+import { DEFAULT_TEMPLATE_SETTINGS, type TemplateSettings } from '@/lib/types/template-settings';
 import { withLocalizedDefaultSections } from '@/lib/utils/section-helpers';
 import { useLanguage } from '@/lib/context/language-context';
 import { buildResumeFilename, downloadBlobAsFile, openUrlInNewTab } from '@/lib/utils/download';
@@ -64,11 +66,14 @@ import {
   LEGACY_RESUME_DRAFT_STORAGE_KEY,
   parseResumeDraft,
   isResumeDataShape,
+  isSameResumeData,
   safeStorage,
   shouldPromptForDraftRestore,
   type ResumeDraftEnvelope,
 } from '@/lib/utils/resume-draft-storage';
 import type { RegenerateItemInput } from '@/lib/api/enrichment';
+import { AgentPromptDialog, type AgentTask } from '@/components/agent/agent-prompt-dialog';
+import { useAgentRefresh } from '@/hooks/use-agent-refresh';
 import { clearResumeWizardCompletion } from '@/lib/utils/resume-wizard-storage';
 import {
   clearAttachmentDraft,
@@ -77,11 +82,27 @@ import {
   type AttachmentDraftEnvelope,
 } from '@/lib/utils/attachment-draft-storage';
 
-type TabId = 'resume' | 'cover-letter' | 'outreach' | 'interview-prep' | 'jd-match';
+type TabId =
+  | 'resume'
+  | 'cover-letter'
+  | 'outreach'
+  | 'interview-prep'
+  | 'jd-match'
+  | 'ats-check'
+  | 'writing';
 type JobContextStatus = 'idle' | 'loading' | 'available' | 'missing';
 
-const TAB_IDS: TabId[] = ['resume', 'cover-letter', 'outreach', 'interview-prep', 'jd-match'];
+const TAB_IDS: TabId[] = [
+  'resume',
+  'cover-letter',
+  'outreach',
+  'interview-prep',
+  'jd-match',
+  'ats-check',
+  'writing',
+];
 const RESUME_AUTOSAVE_DEBOUNCE_MS = 2500;
+const FORMATTING_SAVE_DEBOUNCE_MS = 600;
 const RESUME_AUTOSAVE_MAX_WAIT_MS = 12000;
 // Floor for the computed delay. Without it, once an unsynced streak exceeds the
 // max wait the delay pins to 0 and every keystroke schedules an immediate
@@ -123,6 +144,32 @@ const buildInitialData = (t: Translate): ResumeData => ({
 });
 
 type StoredResumeDraft = ResumeDraftEnvelope & { storageKey: string };
+
+type ServerResume = Awaited<ReturnType<typeof fetchResume>>;
+type OwnWrites = { pending: number; epoch: number };
+/** The parts of a resume the agent can change and the editor saves separately. */
+type AgentPart = 'resume' | 'coverLetter' | 'outreach';
+
+/** Identifies one saved version of the parts the agent can change. */
+const agentVersionOf = (data: ServerResume): string =>
+  JSON.stringify([
+    data.processed_resume,
+    data.cover_letter ?? '',
+    data.outreach_message ?? '',
+    data.title ?? null,
+  ]);
+
+/**
+ * Count a write this editor makes. While one is pending, or when one finished
+ * during an agent-change check, the server copy may be the editor's own save,
+ * so the check skips that round.
+ */
+const trackOwnWrite = <T,>(writes: { current: OwnWrites }, write: Promise<T>): Promise<T> => {
+  writes.current = { pending: writes.current.pending + 1, epoch: writes.current.epoch + 1 };
+  return write.finally(() => {
+    writes.current = { pending: writes.current.pending - 1, epoch: writes.current.epoch + 1 };
+  });
+};
 
 const withStorageKey = (
   draft: ResumeDraftEnvelope | null,
@@ -173,7 +220,12 @@ const clearResumeDraftStorageKey = (storageKey: string): void => {
   safeStorage.remove(storageKey);
 };
 
-const ResumeBuilderContent = () => {
+interface ResumeBuilderProps {
+  /** The user's coding agent does the AI work: AI actions show a prompt for it. */
+  agentMode?: boolean;
+}
+
+const ResumeBuilderContent = ({ agentMode = false }: ResumeBuilderProps) => {
   const { t } = useTranslations();
   const { uiLanguage, contentLanguage } = useLanguage();
   const [notificationDialog, setNotificationDialog] = useState<{
@@ -213,9 +265,20 @@ const ResumeBuilderContent = () => {
   const [hasCurrentLocalDraft, setHasCurrentLocalDraft] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [loadingState, setLoadingState] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle');
-  const [templateSettings, setTemplateSettings] = useState<TemplateSettings>(
-    readStoredTemplateSettings
-  );
+  // The resume's own formatting, applied when it loads. A resume never formatted
+  // keeps the defaults.
+  const [templateSettings, setTemplateSettings] =
+    useState<TemplateSettings>(DEFAULT_TEMPLATE_SETTINGS);
+  const [formattingSaveFailed, setFormattingSaveFailed] = useState(false);
+  const pendingFormattingRef = useRef<{
+    resumeId: string;
+    settings: TemplateSettings;
+    order: { session: string; revision: number };
+  } | null>(null);
+  const formattingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // This builder session's id and save counter (see updateResumeTemplateSettings).
+  const formattingSessionRef = useRef<string | null>(null);
+  const formattingRevisionRef = useRef(0);
   const { improvedData } = useResumePreview();
   const improvedPreview = improvedData?.data?.resume_preview;
   const improvedCoverLetter = improvedData?.data?.cover_letter;
@@ -281,7 +344,6 @@ const ResumeBuilderContent = () => {
   const coverLetterSaveCountRef = useRef(0);
   const outreachSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const outreachSaveCountRef = useRef(0);
-  const [isCopied, setIsCopied] = useState(false);
   const [resumeTitle, setResumeTitle] = useState<string | null>(null);
 
   // On-demand generation state
@@ -293,9 +355,25 @@ const ResumeBuilderContent = () => {
   const [showRegenerateDialog, setShowRegenerateDialog] = useState<
     'cover-letter' | 'outreach' | 'interview-prep' | null
   >(null);
+  const [agentTask, setAgentTask] = useState<AgentTask | null>(null);
+  // Agent mode: the agent's saved version, waiting while the user has unsaved
+  // edits to the same part, and when one was last applied here.
+  const [agentUpdate, setAgentUpdate] = useState<ServerResume | null>(null);
+  const [agentAppliedAt, setAgentAppliedAt] = useState<number | null>(null);
+  // Remounts the resume form only when the agent replaced the resume itself, so
+  // in-progress form state survives agent updates to other parts.
+  const [resumeFormKey, setResumeFormKey] = useState(0);
+  const ownWritesRef = useRef<OwnWrites>({ pending: 0, epoch: 0 });
+  const lastSavedDataRef = useRef<ResumeData>(initialData);
+  const agentCheckRunningRef = useRef(false);
+  const dismissedAgentVersionRef = useRef<string | null>(null);
 
   // JD comparison state
   const [jobDescription, setJobDescription] = useState<string | null>(null);
+  // The job's saved keywords (null when it has none) and company, for JD Match.
+  const [jobKeywords, setJobKeywords] = useState<string[] | null>(null);
+  const [jobCompany, setJobCompany] = useState<string | null>(null);
+  const [jobForcedKeywords, setJobForcedKeywords] = useState<string[]>([]);
   const [jobContextStatus, setJobContextStatus] = useState<JobContextStatus>('idle');
 
   // AI Regenerate wizard
@@ -392,11 +470,6 @@ const ResumeBuilderContent = () => {
     [canonicalResumeDataForPreview, t]
   );
 
-  // Save template settings to localStorage when they change
-  useEffect(() => {
-    safeStorage.set(TEMPLATE_SETTINGS_STORAGE_KEY, JSON.stringify(templateSettings));
-  }, [templateSettings]);
-
   // Warn user before leaving with unsaved changes
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -458,6 +531,8 @@ const ResumeBuilderContent = () => {
           setIsTailoredResume(Boolean(data.parent_id));
           // Store resume title for downloads
           setResumeTitle(data.title ?? null);
+          setTemplateSettings(data.template_settings ?? DEFAULT_TEMPLATE_SETTINGS);
+          setFormattingSaveFailed(false);
           // These values belong to this resume. Explicitly applying empty values
           // prevents the preceding document's attachment from surviving a switch.
           const serverCoverLetter = data.cover_letter ?? '';
@@ -546,7 +621,7 @@ const ResumeBuilderContent = () => {
       setLoadingState('loaded');
     };
 
-    loadResumeData();
+    void loadResumeData();
 
     return () => {
       cancelled = true;
@@ -580,6 +655,9 @@ const ResumeBuilderContent = () => {
           const data = await fetchJobDescription(resumeId);
           if (!cancelled) {
             setJobDescription(data.content);
+            setJobKeywords(data.keywords);
+            setJobCompany(data.company);
+            setJobForcedKeywords(data.forced_keywords ?? []);
             setJobContextStatus('available');
           }
         } catch (err) {
@@ -597,7 +675,7 @@ const ResumeBuilderContent = () => {
       }
     };
 
-    loadJobDescription();
+    void loadJobDescription();
     return () => {
       cancelled = true;
     };
@@ -616,9 +694,108 @@ const ResumeBuilderContent = () => {
     [resumeId]
   );
 
-  const handleSettingsChange = useCallback((newSettings: TemplateSettings) => {
-    setTemplateSettings(newSettings);
+  // Sends right away, also while the page unloads (the request is keepalive). Each save
+  // carries the next number in this session, so one that arrives late cannot undo a
+  // newer choice from this tab.
+  const flushFormattingSave = useCallback(() => {
+    if (formattingTimerRef.current) clearTimeout(formattingTimerRef.current);
+    formattingTimerRef.current = null;
+    const pending = pendingFormattingRef.current;
+    pendingFormattingRef.current = null;
+    if (!pending) return;
+    updateResumeTemplateSettings(pending.resumeId, pending.settings, pending.order).then(
+      () => setFormattingSaveFailed(false),
+      (error) => {
+        console.error('Failed to save resume formatting:', error);
+        setFormattingSaveFailed(true);
+      }
+    );
   }, []);
+
+  // Formatting is saved with the resume, so its view page and PDF match the builder.
+  const handleSettingsChange = useCallback(
+    (newSettings: TemplateSettings) => {
+      // Until the resume (and its saved formatting) has loaded, a change would save
+      // the defaults over it.
+      if (loadingState !== 'loaded') return;
+      setTemplateSettings(newSettings);
+      if (!resumeId) return;
+      formattingSessionRef.current ??= `${Date.now().toString(36)}-${Math.random()
+        .toString(36)
+        .slice(2, 10)}`;
+      pendingFormattingRef.current = {
+        resumeId,
+        settings: newSettings,
+        order: {
+          session: formattingSessionRef.current,
+          revision: ++formattingRevisionRef.current,
+        },
+      };
+      if (formattingTimerRef.current) clearTimeout(formattingTimerRef.current);
+      formattingTimerRef.current = setTimeout(flushFormattingSave, FORMATTING_SAVE_DEBOUNCE_MS);
+    },
+    [resumeId, loadingState, flushFormattingSave]
+  );
+
+  // Save pending formatting before switching resumes, leaving the builder, or a
+  // refresh or tab close (which skip React cleanup).
+  useEffect(() => () => flushFormattingSave(), [resumeId, flushFormattingSave]);
+  useEffect(() => {
+    const onPageHide = () => flushFormattingSave();
+    window.addEventListener('pagehide', onPageHide);
+    return () => window.removeEventListener('pagehide', onPageHide);
+  }, [flushFormattingSave]);
+
+  useEffect(() => {
+    lastSavedDataRef.current = lastSavedData;
+  }, [lastSavedData]);
+
+  /**
+   * Agent mode, before a resume save: the agent's version if it saved the resume
+   * since this editor last loaded or saved it. The periodic check can miss that
+   * window (autosave runs sooner), and saving then would silently replace the
+   * agent's work. Returns null when the server copy is the editor's own, when a
+   * save of ours is in flight (the difference is then most likely ours), or when
+   * the server cannot be read (saving proceeds as before).
+   */
+  const findAgentConflict = useCallback(
+    async (part: AgentPart): Promise<ServerResume | null> => {
+      if (!agentMode || !resumeId || ownWritesRef.current.pending > 0) return null;
+      try {
+        const data = await fetchResume(resumeId);
+        const baselines = attachmentBaselinesRef.current;
+        const changed =
+          part === 'resume'
+            ? isResumeDataShape(data.processed_resume) &&
+              !isSameResumeData(data.processed_resume, lastSavedDataRef.current)
+            : part === 'coverLetter'
+              ? (data.cover_letter ?? '') !== baselines.coverLetter
+              : (data.outreach_message ?? '') !== baselines.outreachMessage;
+        if (!changed || agentVersionOf(data) === dismissedAgentVersionRef.current) return null;
+        return data;
+      } catch (error) {
+        console.warn('Could not check for agent changes before saving:', error);
+        return null;
+      }
+    },
+    [agentMode, resumeId]
+  );
+
+  /**
+   * Whether saving `part` now is safe. While the user has not chosen between
+   * their edits and the agent's version, or when the agent has just saved this
+   * part, it shows the banner (and, with `notify`, says why) and returns false.
+   */
+  const agentAllowsSave = useCallback(
+    async (part: AgentPart, notify: boolean): Promise<boolean> => {
+      const agentVersion = agentUpdate ?? (await findAgentConflict(part));
+      if (!agentVersion) return true;
+      setAgentUpdate(agentVersion);
+      if (notify) showNotification(t('builder.agentUpdate.chooseFirst'), 'warning');
+      return false;
+    },
+    [agentUpdate, findAgentConflict, showNotification, t]
+  );
 
   const queueResumeSave = useCallback(
     (editorData: ResumeData) => {
@@ -627,16 +804,19 @@ const ResumeBuilderContent = () => {
       }
 
       const canonicalPayload = normalizeResumeForSave(editorData);
-      const runSave = resumeSaveQueueRef.current
-        .catch(() => {
-          // Keep the queue alive after a failed save so the next edit can still persist.
-        })
-        .then(() => {
-          if (!documentIsActiveRef.current) {
-            throw new DOMException('Editor closed', 'AbortError');
-          }
-          return updateResume(resumeId, canonicalPayload);
-        });
+      const runSave = trackOwnWrite(
+        ownWritesRef,
+        resumeSaveQueueRef.current
+          .catch(() => {
+            // Keep the queue alive after a failed save so the next edit can still persist.
+          })
+          .then(() => {
+            if (!documentIsActiveRef.current) {
+              throw new DOMException('Editor closed', 'AbortError');
+            }
+            return updateResume(resumeId, canonicalPayload);
+          })
+      );
 
       resumeSaveQueueRef.current = runSave.then(
         () => undefined,
@@ -659,7 +839,9 @@ const ResumeBuilderContent = () => {
       isSaving ||
       isAutoSaving ||
       autoSaveError ||
-      regenerateWizard.step !== 'idle'
+      regenerateWizard.step !== 'idle' ||
+      // The user has not chosen between their edits and the agent's version.
+      agentUpdate
     ) {
       return;
     }
@@ -681,6 +863,12 @@ const ResumeBuilderContent = () => {
       // its floor, and every subsequent keystroke schedules another PATCH.
       unsyncedSinceRef.current = Date.now();
       try {
+        const agentVersion = await findAgentConflict('resume');
+        if (agentVersion) {
+          // Ask the user instead; autosave stays paused until they choose.
+          setAgentUpdate(agentVersion);
+          return;
+        }
         const { response, canonicalPayload } = await queueResumeSave(editorSnapshot);
         if (!documentIsActiveRef.current) return;
         // Prefer the server's copy: it may rewrite the payload (e.g. aligning
@@ -708,7 +896,9 @@ const ResumeBuilderContent = () => {
 
     return () => window.clearTimeout(timerId);
   }, [
+    agentUpdate,
     autoSaveError,
+    findAgentConflict,
     hasUnsavedChanges,
     isAutoSaving,
     isSaving,
@@ -736,8 +926,14 @@ const ResumeBuilderContent = () => {
 
       try {
         setIsSaving(true);
+        // Capture the text and its edit number before any wait, so edits typed
+        // meanwhile stay unsaved (and autosave picks them up) instead of being
+        // marked saved.
         const versionAtFlush = editVersionRef.current;
         const editorSnapshot = resumeData;
+        // Agent mode: never save over the agent's version before the user has
+        // chosen between it and their edits (Download, Back and Save all land here).
+        if (!(await agentAllowsSave('resume', showErrorDialog))) return false;
         const { response, canonicalPayload } = await queueResumeSave(editorSnapshot);
         if (!documentIsActiveRef.current) return false;
         setLastSavedData((response?.processed_resume as ResumeData) ?? canonicalPayload);
@@ -770,6 +966,7 @@ const ResumeBuilderContent = () => {
       }
     },
     [
+      agentAllowsSave,
       autoSaveError,
       hasUnsavedChanges,
       loadingState,
@@ -920,6 +1117,145 @@ const ResumeBuilderContent = () => {
     setPendingAttachmentDraftRestore(null);
   };
 
+  // Agent mode: the parts of the server copy that differ from what this editor
+  // last loaded or saved, i.e. what the user's coding agent changed.
+  const agentChanges = (data: ServerResume) => {
+    const serverResume = isResumeDataShape(data.processed_resume) ? data.processed_resume : null;
+    const coverLetter = data.cover_letter ?? '';
+    const outreachMessage = data.outreach_message ?? '';
+    const baselines = attachmentBaselinesRef.current;
+    return {
+      serverResume,
+      coverLetter,
+      outreachMessage,
+      resume: Boolean(serverResume && !isSameResumeData(serverResume, lastSavedData)),
+      coverLetterChanged: coverLetter !== baselines.coverLetter,
+      outreachChanged: outreachMessage !== baselines.outreachMessage,
+      title: (data.title ?? null) !== resumeTitle,
+    };
+  };
+
+  /**
+   * Show the agent's version of each part it changed, replacing any unsaved
+   * edits to that part. Parts the agent did not change keep the user's edits.
+   */
+  const applyAgentVersion = (data: ServerResume) => {
+    const changes = agentChanges(data);
+    // Invalidates any check that started before this, so it cannot reopen the banner.
+    editVersionRef.current += 1;
+    if (changes.serverResume && changes.resume) {
+      setResumeFormKey((key) => key + 1);
+      setResumeData(changes.serverResume);
+      setLastSavedData(changes.serverResume);
+      setHasUnsavedChanges(false);
+      syncedVersionRef.current = editVersionRef.current;
+      unsyncedSinceRef.current = null;
+      setAutoSaveError(null);
+      clearStoredResumeDraft(resumeId);
+      setHasCurrentLocalDraft(false);
+    }
+    const values = { ...attachmentValuesRef.current };
+    const baselines = { ...attachmentBaselinesRef.current };
+    if (changes.coverLetterChanged) {
+      coverLetterEditVersionRef.current += 1;
+      values.coverLetter = changes.coverLetter;
+      baselines.coverLetter = changes.coverLetter;
+      setCoverLetter(changes.coverLetter);
+      setHasUnsavedCoverLetter(false);
+    }
+    if (changes.outreachChanged) {
+      outreachEditVersionRef.current += 1;
+      values.outreachMessage = changes.outreachMessage;
+      baselines.outreachMessage = changes.outreachMessage;
+      setOutreachMessage(changes.outreachMessage);
+      setHasUnsavedOutreach(false);
+    }
+    attachmentValuesRef.current = values;
+    attachmentBaselinesRef.current = baselines;
+    persistAttachmentDraft(values, baselines);
+    if (changes.title) setResumeTitle(data.title ?? null);
+    setAgentUpdate(null);
+    setAgentAppliedAt(Date.now());
+  };
+
+  const checkForAgentChanges = async () => {
+    if (
+      !resumeId ||
+      loadingState !== 'loaded' ||
+      agentCheckRunningRef.current ||
+      ownWritesRef.current.pending > 0 ||
+      isSaving ||
+      isAutoSaving ||
+      regenerateWizard.step !== 'idle' ||
+      pendingDraftRestore ||
+      pendingAttachmentDraftRestore
+    ) {
+      return;
+    }
+    const before = [
+      ownWritesRef.current.epoch,
+      editVersionRef.current,
+      coverLetterEditVersionRef.current,
+      outreachEditVersionRef.current,
+    ].join();
+    agentCheckRunningRef.current = true;
+    try {
+      const data = await fetchResume(resumeId);
+      const after = [
+        ownWritesRef.current.epoch,
+        editVersionRef.current,
+        coverLetterEditVersionRef.current,
+        outreachEditVersionRef.current,
+      ].join();
+      // An edit or save happened meanwhile: this state no longer matches the server read.
+      if (!documentIsActiveRef.current || ownWritesRef.current.pending > 0 || after !== before) {
+        return;
+      }
+      const changes = agentChanges(data);
+      if (
+        !changes.resume &&
+        !changes.coverLetterChanged &&
+        !changes.outreachChanged &&
+        !changes.title
+      ) {
+        if (agentUpdate) setAgentUpdate(null);
+        return;
+      }
+      if (agentVersionOf(data) === dismissedAgentVersionRef.current) return;
+      const conflict =
+        (changes.resume && hasUnsavedChanges) ||
+        (changes.coverLetterChanged && hasUnsavedCoverLetter) ||
+        (changes.outreachChanged && hasUnsavedOutreach);
+      if (conflict) setAgentUpdate(data);
+      else applyAgentVersion(data);
+    } catch (error) {
+      console.warn('Could not check for agent changes:', error);
+    } finally {
+      agentCheckRunningRef.current = false;
+    }
+  };
+
+  useAgentRefresh(agentMode && loadingState === 'loaded', () => checkForAgentChanges());
+  // The agent can add keywords to this resume's job (set_job_keywords) while the page is open.
+  useAgentRefresh(
+    agentMode && jobContextStatus === 'available' && jobKeywords === null,
+    async () => {
+      if (!resumeId) return;
+      const data = await fetchJobDescription(resumeId);
+      if (data.keywords) {
+        setJobKeywords(data.keywords);
+        setJobCompany(data.company);
+      }
+    }
+  );
+
+  const handleKeepMyEdits = () => {
+    if (!agentUpdate) return;
+    // Autosave resumes and replaces the agent's version with these edits.
+    dismissedAgentVersionRef.current = agentVersionOf(agentUpdate);
+    setAgentUpdate(null);
+  };
+
   const getCompanyFromTitle = (title: string | null | undefined): string | null => {
     if (!title) return null;
     const atIdx = title.lastIndexOf(' @ ');
@@ -944,7 +1280,8 @@ const ResumeBuilderContent = () => {
   const handleStartRegenerate = async () => {
     const didSave = await flushResumeChanges(true);
     if (didSave) {
-      regenerateWizard.startRegenerate();
+      if (agentMode) setAgentTask('regenerate');
+      else regenerateWizard.startRegenerate();
     }
   };
 
@@ -964,7 +1301,7 @@ const ResumeBuilderContent = () => {
       const userName = resumeData.personalInfo?.name?.trim() || null;
       const filename = buildResumeFilename(userName, company, resumeId, 'resume');
       downloadBlobAsFile(blob, filename);
-      showNotification(t('builder.alerts.downloadSuccess'), 'success');
+      toast.success(t('builder.alerts.downloadSuccess'));
     } catch (error) {
       console.error('Failed to download resume:', error);
       if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
@@ -990,10 +1327,13 @@ const ResumeBuilderContent = () => {
     queue: React.RefObject<Promise<void>>,
     action: () => Promise<T>
   ): Promise<T> => {
-    const operation = queue.current.then(() => {
-      if (!documentIsActiveRef.current) throw new DOMException('Editor closed', 'AbortError');
-      return action();
-    });
+    const operation = trackOwnWrite(
+      ownWritesRef,
+      queue.current.then(() => {
+        if (!documentIsActiveRef.current) throw new DOMException('Editor closed', 'AbortError');
+        return action();
+      })
+    );
     queue.current = operation.then(
       () => undefined,
       () => undefined
@@ -1010,6 +1350,7 @@ const ResumeBuilderContent = () => {
     try {
       coverLetterSaveCountRef.current += 1;
       setIsCoverLetterSaving(true);
+      if (!(await agentAllowsSave('coverLetter', showFailure))) return false;
       // A prior generation or newer edit can replace the value while this save waits.
       const { savedContent, savedVersion } = await queueAttachmentWrite(
         coverLetterSaveQueueRef,
@@ -1126,6 +1467,7 @@ const ResumeBuilderContent = () => {
     try {
       outreachSaveCountRef.current += 1;
       setIsOutreachSaving(true);
+      if (!(await agentAllowsSave('outreach', showFailure))) return false;
       const { savedContent, savedVersion } = await queueAttachmentWrite(
         outreachSaveQueueRef,
         async () => {
@@ -1160,16 +1502,6 @@ const ResumeBuilderContent = () => {
       if (documentIsActiveRef.current) setIsOutreachSaving(outreachSaveCountRef.current > 0);
     }
   }
-
-  const handleCopyOutreach = async () => {
-    try {
-      await navigator.clipboard.writeText(outreachMessage);
-      setIsCopied(true);
-      setTimeout(() => setIsCopied(false), 2000);
-    } catch (error) {
-      console.error('Failed to copy:', error);
-    }
-  };
 
   // On-demand generation handlers
   const doGenerateCoverLetter = async () => {
@@ -1210,12 +1542,16 @@ const ResumeBuilderContent = () => {
 
   const handleGenerateCoverLetter = () => {
     if (!resumeId || loadingState !== 'loaded') return;
+    if (agentMode) {
+      setAgentTask('coverLetter');
+      return;
+    }
     // If content exists, show confirmation dialog
     if (coverLetter) {
       setShowRegenerateDialog('cover-letter');
       return;
     }
-    doGenerateCoverLetter();
+    void doGenerateCoverLetter();
   };
 
   const doGenerateOutreach = async () => {
@@ -1255,12 +1591,16 @@ const ResumeBuilderContent = () => {
 
   const handleGenerateOutreach = () => {
     if (!resumeId || loadingState !== 'loaded') return;
+    if (agentMode) {
+      setAgentTask('outreach');
+      return;
+    }
     // If content exists, show confirmation dialog
     if (outreachMessage) {
       setShowRegenerateDialog('outreach');
       return;
     }
-    doGenerateOutreach();
+    void doGenerateOutreach();
   };
 
   const canGenerateInterviewPrep =
@@ -1305,11 +1645,15 @@ const ResumeBuilderContent = () => {
 
   const handleGenerateInterviewPrep = () => {
     if (!canGenerateInterviewPrep) return;
+    if (agentMode) {
+      setAgentTask('interviewPrep');
+      return;
+    }
     if (interviewPrep) {
       setShowRegenerateDialog('interview-prep');
       return;
     }
-    doGenerateInterviewPrep();
+    void doGenerateInterviewPrep();
   };
 
   const regenerateDialogContentTitle =
@@ -1328,234 +1672,229 @@ const ResumeBuilderContent = () => {
 
   const handleConfirmRegenerate = () => {
     if (showRegenerateDialog === 'cover-letter') {
-      doGenerateCoverLetter();
+      void doGenerateCoverLetter();
     } else if (showRegenerateDialog === 'outreach') {
-      doGenerateOutreach();
+      void doGenerateOutreach();
     } else if (showRegenerateDialog === 'interview-prep') {
-      doGenerateInterviewPrep();
+      void doGenerateInterviewPrep();
     }
   };
 
   const resumeSaveStatus = (() => {
     if (isSaving || isAutoSaving) {
-      return { label: t('builder.autoSave.saving'), tone: 'blue' as const };
+      return { label: t('builder.autoSave.saving'), tone: 'active' as const };
     }
     if (autoSaveError) {
-      return { label: autoSaveError, tone: 'red' as const };
+      return { label: autoSaveError, tone: 'error' as const };
+    }
+    if (formattingSaveFailed) {
+      return { label: t('builder.alerts.formattingSaveFailed'), tone: 'error' as const };
     }
     if (hasUnsavedChanges) {
       return hasCurrentLocalDraft
-        ? { label: t('builder.autoSave.localDraft'), tone: 'amber' as const }
-        : { label: t('builder.autoSave.localDraftUnavailable'), tone: 'red' as const };
+        ? { label: t('builder.autoSave.localDraft'), tone: 'warning' as const }
+        : { label: t('builder.autoSave.localDraftUnavailable'), tone: 'error' as const };
+    }
+    if (agentAppliedAt && agentAppliedAt > (lastAutoSavedAt ?? 0)) {
+      return { label: t('builder.agentUpdate.applied'), tone: 'ready' as const };
     }
     if (resumeId && lastAutoSavedAt) {
-      return { label: t('builder.autoSave.saved'), tone: 'green' as const };
+      return { label: t('builder.autoSave.saved'), tone: 'ready' as const };
     }
     return null;
   })();
 
-  // Swiss tokens rather than raw Tailwind palette classes, matching the tone
-  // set used by StatCard in diff-preview-modal.tsx (L-09).
-  const resumeSaveStatusStyles = {
-    amber: 'border-warning bg-[#FFF7ED] text-warning',
-    blue: 'border-primary bg-[#EFF6FF] text-primary',
-    green: 'border-success bg-[#F0FDF4] text-success',
-    red: 'border-destructive bg-[#FEF2F2] text-destructive',
-  };
-  const ResumeSaveStatusIcon = resumeSaveStatus?.tone === 'green' ? Check : AlertTriangle;
+  const nothingYet = <EmptyState className="px-6" title={t('builder.panels.nothingYet')} />;
 
   return (
-    <div className="h-screen w-full bg-background flex justify-center items-center p-4 md:p-8">
+    <div className="h-screen w-full bg-canvas flex justify-center items-center p-2 md:p-4">
       {/* Main Container */}
-      <div className="w-full h-full max-w-[90%] md:max-w-[95%] xl:max-w-[1800px] border border-black bg-background shadow-sw-lg flex flex-col">
-        {/* Header Section */}
-        <div className="border-b border-black p-6 md:p-8 bg-background no-print">
-          {/* Top Row: Back button and Actions */}
-          <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
-            <div>
-              <Button variant="link" onClick={handleBackToDashboard} className="mb-2 -ml-1">
-                <ArrowLeft className="w-4 h-4" />
-                {t('nav.backToDashboard')}
-              </Button>
-              <h1 className="font-serif text-3xl md:text-5xl text-black tracking-tight leading-[0.95] uppercase">
-                {t('nav.builder')}
-              </h1>
-              <div className="mt-3 flex items-center gap-3">
-                <p className="text-sm font-mono text-blue-700 uppercase tracking-wide font-bold">
-                  {'// '}
-                  {resumeId ? t('builder.editMode') : t('builder.createAndPreview')}
-                </p>
-                {resumeSaveStatus && (
-                  <span
-                    className={`flex items-center gap-1 text-xs font-mono px-2 py-1 border ${resumeSaveStatusStyles[resumeSaveStatus.tone]}`}
-                  >
-                    <ResumeSaveStatusIcon className="w-3 h-3" />
-                    {resumeSaveStatus.label}
-                  </span>
-                )}
-              </div>
-            </div>
-
-            <div className="flex gap-3 mt-4 md:mt-0">
-              {/* Resume tab actions */}
-              {activeTab === 'resume' && (
-                <>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleStartRegenerate}
-                    disabled={!resumeId || isSaving}
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    {t('builder.regenerate.buttonLabel')}
-                  </Button>
-                  <Button
-                    variant="warning"
-                    size="sm"
-                    onClick={handleReset}
-                    disabled={!hasUnsavedChanges}
-                  >
-                    <RotateCcw className="w-4 h-4" />
-                    {t('common.reset')}
-                  </Button>
-                  <Button
-                    size="sm"
-                    onClick={handleSave}
-                    disabled={!resumeId || isSaving || loadingState !== 'loaded'}
-                  >
-                    <Save className="w-4 h-4" />
-                    {isSaving
-                      ? t('common.saving')
-                      : autoSaveError
-                        ? t('builder.autoSave.retrySave')
-                        : hasUnsavedChanges
-                          ? t('builder.autoSave.saveNow')
-                          : t('builder.autoSave.savedButton')}
-                  </Button>
-                  <Button
-                    variant="success"
-                    size="sm"
-                    onClick={handleDownload}
-                    disabled={!resumeId || isDownloading}
-                  >
-                    <Download className="w-4 h-4" />
-                    {isDownloading ? t('common.generating') : t('common.download')}
-                  </Button>
-                </>
+      <div className="w-full h-full border border-ink bg-canvas shadow-sw-lg flex flex-col">
+        {/* Header: one compact toolbar row (owner F2, builder only) */}
+        <PageHeader className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 px-6 py-3 md:px-6 md:py-3 no-print">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
+            <Button variant="outline" size="sm" onClick={handleBackToDashboard}>
+              <ArrowLeft aria-hidden="true" />
+              {t('nav.backToDashboard')}
+            </Button>
+            <PageHeader.Title className="text-2xl leading-tight md:text-3xl">
+              {t('nav.builder')}
+            </PageHeader.Title>
+            <p className="font-mono text-xs font-bold uppercase tracking-wide text-steel">
+              {'// '}
+              {resumeId ? t('builder.editMode') : t('builder.createAndPreview')}
+            </p>
+            <span role="status">
+              {resumeSaveStatus && (
+                <StatusIndicator tone={resumeSaveStatus.tone} live={false}>
+                  {resumeSaveStatus.label}
+                </StatusIndicator>
               )}
+            </span>
+          </div>
 
-              {/* Cover letter tab actions */}
-              {activeTab === 'cover-letter' && coverLetter && (
-                <>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleGenerateCoverLetter}
-                    disabled={isGeneratingCoverLetter}
-                  >
-                    {isGeneratingCoverLetter ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Sparkles className="w-4 h-4" />
-                    )}
-                    {t('coverLetter.regenerate')}
-                  </Button>
-                  <Button
-                    variant="success"
-                    size="sm"
-                    onClick={handleDownloadCoverLetter}
-                    disabled={!resumeId || isDownloading}
-                  >
-                    <Download className="w-4 h-4" />
-                    {isDownloading ? t('common.generating') : t('common.download')}
-                  </Button>
-                </>
-              )}
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Community links: quiet ghost actions, left of the tab's own actions */}
+            <CommunityLinks variant="builder" />
 
-              {/* Outreach tab actions */}
-              {activeTab === 'outreach' && outreachMessage && (
-                <>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleGenerateOutreach}
-                    disabled={isGeneratingOutreach}
-                  >
-                    {isGeneratingOutreach ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Sparkles className="w-4 h-4" />
-                    )}
-                    {t('outreach.regenerate')}
-                  </Button>
-                  <Button variant="success" size="sm" onClick={handleCopyOutreach}>
-                    {isCopied ? (
-                      <>
-                        <Check className="w-4 h-4" />
-                        {t('outreach.copied')}
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-4 h-4" />
-                        {t('outreach.copyToClipboard')}
-                      </>
-                    )}
-                  </Button>
-                </>
-              )}
-
-              {/* Interview prep tab actions */}
-              {activeTab === 'interview-prep' && interviewPrep && (
+            {/* Resume tab actions */}
+            {activeTab === 'resume' && (
+              <>
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={handleGenerateInterviewPrep}
-                  disabled={!canGenerateInterviewPrep || isGeneratingInterviewPrep}
+                  onClick={handleStartRegenerate}
+                  disabled={!resumeId || isSaving}
                 >
-                  {isGeneratingInterviewPrep ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Sparkles className="w-4 h-4" />
-                  )}
-                  {t('interviewPrep.regenerate')}
+                  {t('builder.regenerate.buttonLabel')}
                 </Button>
-              )}
-            </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleReset}
+                  disabled={!hasUnsavedChanges}
+                >
+                  <ArrowCounterClockwise aria-hidden="true" />
+                  {t('common.reset')}
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={handleSave}
+                  disabled={!resumeId || isSaving || loadingState !== 'loaded'}
+                >
+                  <FloppyDisk aria-hidden="true" />
+                  {isSaving
+                    ? t('common.saving')
+                    : autoSaveError
+                      ? t('builder.autoSave.retrySave')
+                      : hasUnsavedChanges
+                        ? t('builder.autoSave.saveNow')
+                        : t('builder.autoSave.savedButton')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDownload}
+                  disabled={!resumeId || isDownloading}
+                >
+                  <DownloadSimple aria-hidden="true" />
+                  {isDownloading ? t('common.generating') : t('common.download')}
+                </Button>
+              </>
+            )}
+
+            {/* Cover letter tab actions */}
+            {activeTab === 'cover-letter' && coverLetter && (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleGenerateCoverLetter}
+                  disabled={isGeneratingCoverLetter}
+                >
+                  {isGeneratingCoverLetter && (
+                    <SpinnerGap aria-hidden="true" className="animate-spin" />
+                  )}
+                  {t('coverLetter.regenerate')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDownloadCoverLetter}
+                  disabled={!resumeId || isDownloading}
+                >
+                  <DownloadSimple aria-hidden="true" />
+                  {isDownloading ? t('common.generating') : t('common.download')}
+                </Button>
+              </>
+            )}
+
+            {/* Outreach tab actions (Copy lives in the editor) */}
+            {activeTab === 'outreach' && outreachMessage && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleGenerateOutreach}
+                disabled={isGeneratingOutreach}
+              >
+                {isGeneratingOutreach && <SpinnerGap aria-hidden="true" className="animate-spin" />}
+                {t('outreach.regenerate')}
+              </Button>
+            )}
+
+            {/* Interview prep tab actions */}
+            {activeTab === 'interview-prep' && interviewPrep && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleGenerateInterviewPrep}
+                disabled={!canGenerateInterviewPrep || isGeneratingInterviewPrep}
+              >
+                {isGeneratingInterviewPrep && (
+                  <SpinnerGap aria-hidden="true" className="animate-spin" />
+                )}
+                {t('interviewPrep.regenerate')}
+              </Button>
+            )}
           </div>
-        </div>
+        </PageHeader>
+
+        {/* Agent mode: the agent saved a part the user is also editing. */}
+        {agentUpdate && (
+          <div className="border-b border-ink px-6 py-3 no-print">
+            <Alert tone="warning" title={t('builder.agentUpdate.conflictTitle')}>
+              <p>{t('builder.agentUpdate.conflictBody')}</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button size="sm" onClick={() => applyAgentVersion(agentUpdate)}>
+                  {t('builder.agentUpdate.useAgent')}
+                </Button>
+                <Button size="sm" variant="outline" onClick={handleKeepMyEdits}>
+                  {t('builder.agentUpdate.keepMine')}
+                </Button>
+              </div>
+            </Alert>
+          </div>
+        )}
 
         {/* Content Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 bg-black gap-[1px] flex-1 min-h-0">
-          {/* Left Panel: Editor */}
-          <div className="bg-background p-6 md:p-8 overflow-y-auto no-print">
-            <div className="max-w-3xl mx-auto space-y-6">
-              <div className="flex items-center gap-2 border-b-2 border-black pb-2">
-                <div className="w-3 h-3 bg-blue-700"></div>
-                <h2 className="font-mono text-lg font-bold uppercase tracking-wider">
-                  {activeTab === 'resume' && t('builder.leftPanel.editorPanel')}
-                  {activeTab === 'cover-letter' && t('builder.leftPanel.coverLetterEditor')}
-                  {activeTab === 'outreach' && t('builder.leftPanel.outreachEditor')}
-                  {activeTab === 'interview-prep' && t('builder.leftPanel.interviewPrep')}
-                  {activeTab === 'jd-match' && t('builder.leftPanel.jdMatchAnalysis')}
-                </h2>
-              </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 bg-ink gap-px flex-1 min-h-0">
+          {/* Left Panel: editor and generate controls */}
+          <div className="bg-canvas p-3 md:p-4 overflow-y-auto no-print">
+            <div className="max-w-3xl space-y-6">
+              <PanelHeader
+                tone="input"
+                title={
+                  activeTab === 'resume'
+                    ? t('builder.leftPanel.editorPanel')
+                    : activeTab === 'cover-letter'
+                      ? t('builder.leftPanel.coverLetterEditor')
+                      : activeTab === 'outreach'
+                        ? t('builder.leftPanel.outreachEditor')
+                        : activeTab === 'interview-prep'
+                          ? t('builder.leftPanel.interviewPrep')
+                          : activeTab === 'jd-match'
+                            ? t('builder.leftPanel.jdMatchAnalysis')
+                            : activeTab === 'writing'
+                              ? t('builder.leftPanel.writing')
+                              : t('builder.leftPanel.atsCheck')
+                }
+              />
 
               {/* Resume Editor */}
               {activeTab === 'resume' &&
                 (loadingState === 'error' ? (
-                  <div
-                    role="alert"
-                    className="border border-destructive bg-[#FEF2F2] p-4 font-mono text-xs text-destructive"
-                  >
-                    {t('builder.alerts.loadFailed')}
-                  </div>
+                  <Alert tone="error">{t('builder.alerts.loadFailed')}</Alert>
                 ) : (
                   <>
                     <FormattingControls
                       settings={templateSettings}
                       onChange={handleSettingsChange}
                     />
-                    <ResumeForm resumeData={resumeData} onUpdate={handleUpdate} />
+                    <ResumeForm
+                      key={resumeFormKey}
+                      resumeData={resumeData}
+                      onUpdate={handleUpdate}
+                    />
                   </>
                 ))}
 
@@ -1595,24 +1934,38 @@ const ResumeBuilderContent = () => {
                   />
                 ))}
 
-              {/* Interview Prep Read-Only View */}
-              {activeTab === 'interview-prep' && (
-                <InterviewPrepView
-                  interviewPrep={interviewPrep}
-                  isGenerating={isGeneratingInterviewPrep}
-                  error={interviewPrepError}
-                  onGenerate={handleGenerateInterviewPrep}
-                  isTailoredResume={isTailoredResume}
-                  canGenerate={canGenerateInterviewPrep}
-                  unavailableMessage={interviewPrepUnavailableMessage}
-                  className="p-0"
-                />
-              )}
+              {/* Interview Prep: generate controls here, the output renders on the right */}
+              {activeTab === 'interview-prep' &&
+                (interviewPrep ? (
+                  <p className="max-w-[60ch] text-sm text-ink-soft text-pretty">
+                    {t('builder.generatePrompt.interviewPrepFooter')}
+                  </p>
+                ) : (
+                  <InterviewPrepView
+                    interviewPrep={null}
+                    isGenerating={isGeneratingInterviewPrep}
+                    error={interviewPrepError}
+                    onGenerate={handleGenerateInterviewPrep}
+                    isTailoredResume={isTailoredResume}
+                    canGenerate={canGenerateInterviewPrep}
+                    unavailableMessage={interviewPrepUnavailableMessage}
+                  />
+                ))}
 
               {/* JD Match Info Panel */}
               {activeTab === 'jd-match' && (
                 <div className="space-y-4">
-                  <div className="border-2 border-black bg-white p-4">
+                  {resumeId && jobContextStatus === 'available' && (
+                    <AtsScorePanel
+                      key={resumeId}
+                      resumeId={resumeId}
+                      hasUnsavedChanges={hasUnsavedChanges}
+                      hasJobKeywords={jobKeywords !== null}
+                      template={templateSettings.template}
+                    />
+                  )}
+
+                  <div className="border-2 border-ink bg-white p-4">
                     <h3 className="font-mono text-sm font-bold uppercase mb-2">
                       {t('builder.jdMatch.aboutTitle')}
                     </h3>
@@ -1621,7 +1974,7 @@ const ResumeBuilderContent = () => {
                     </p>
                   </div>
 
-                  <div className="border-2 border-black bg-background p-4">
+                  <div className="border-2 border-ink bg-canvas p-4">
                     <h3 className="font-mono text-sm font-bold uppercase mb-2">
                       {t('builder.jdMatch.highlightedKeywordsTitle')}
                     </h3>
@@ -1635,7 +1988,7 @@ const ResumeBuilderContent = () => {
                         return (
                           <>
                             {parts[0]}
-                            <mark className="bg-yellow-200 px-1">
+                            <mark className="bg-highlight px-1">
                               {t('builder.jdMatch.highlightColor')}
                             </mark>
                             {parts.slice(1).join('__COLOR__')}
@@ -1643,9 +1996,17 @@ const ResumeBuilderContent = () => {
                         );
                       })()}
                     </p>
+                    {jobForcedKeywords.length > 0 && (
+                      <p className="mt-2 text-sm text-ink-soft leading-relaxed">
+                        <mark className="bg-primary px-1 text-white">
+                          {t('builder.jdMatch.forcedColor')}
+                        </mark>{' '}
+                        {t('builder.jdMatch.forcedLegend')}
+                      </p>
+                    )}
                   </div>
 
-                  <div className="border-2 border-black bg-white p-4">
+                  <div className="border-2 border-ink bg-white p-4">
                     <h3 className="font-mono text-sm font-bold uppercase mb-2">
                       {t('builder.jdMatch.tipsTitle')}
                     </h3>
@@ -1657,14 +2018,66 @@ const ResumeBuilderContent = () => {
                   </div>
                 </div>
               )}
+
+              {/* Writing: score, Improve writing and its review */}
+              {activeTab === 'writing' && (
+                <WritingPanel
+                  resumeData={resumeData}
+                  onApply={(data) => {
+                    handleUpdate(data);
+                    setResumeFormKey((key) => key + 1);
+                  }}
+                  agentMode={agentMode}
+                  onAgentPrompt={() => setAgentTask('improveWriting')}
+                />
+              )}
+
+              {/* ATS Check Info Panel */}
+              {activeTab === 'ats-check' && (
+                <div className="space-y-4">
+                  <div className="border-2 border-ink bg-white p-4">
+                    <h3 className="font-mono text-sm font-bold uppercase mb-2">
+                      {t('builder.atsCheck.aboutTitle')}
+                    </h3>
+                    <p className="text-sm text-ink-soft leading-relaxed">
+                      {t('builder.atsCheck.aboutDescription')}
+                    </p>
+                  </div>
+                  <div className="border-2 border-ink bg-canvas p-4">
+                    <h3 className="font-mono text-sm font-bold uppercase mb-2">
+                      {t('builder.atsCheck.roundTripTitle')}
+                    </h3>
+                    <p className="text-sm text-ink-soft leading-relaxed">
+                      {t('builder.atsCheck.roundTripDescription')}
+                    </p>
+                  </div>
+                  <div className="border-2 border-ink bg-white p-4">
+                    <h3 className="font-mono text-sm font-bold uppercase mb-2">
+                      {t('builder.atsCheck.tipsTitle')}
+                    </h3>
+                    <ul className="text-sm text-ink-soft space-y-1 list-disc list-inside">
+                      <li>{t('builder.atsCheck.tips.items.singleColumn')}</li>
+                      <li>{t('builder.atsCheck.tips.items.standardHeadings')}</li>
+                      <li>{t('builder.atsCheck.tips.items.contactInBody')}</li>
+                    </ul>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Right Panel: Preview with Tabs */}
-          <div className="bg-secondary overflow-hidden flex flex-col no-print">
-            {/* Tabs Header */}
-            <div className="px-6 pt-3 shrink-0 bg-secondary">
+          {/* Right Panel: output only */}
+          <div className="bg-panel overflow-hidden flex flex-col no-print">
+            {/* Panel caption and tabs */}
+            <div className="px-3 pt-3 md:px-4 shrink-0 bg-panel">
+              <PanelHeader
+                tone="output"
+                title={t('builder.panels.preview')}
+                titleId="builder-preview-heading"
+              />
               <RetroTabs
+                idPrefix="builder"
+                aria-labelledby="builder-preview-heading"
                 tabs={[
                   { id: 'resume', label: t('builder.previewTabs.resume') },
                   {
@@ -1687,16 +2100,27 @@ const ResumeBuilderContent = () => {
                     label: t('builder.previewTabs.jdMatch'),
                     disabled: !jobDescription,
                   },
+                  {
+                    id: 'ats-check',
+                    label: t('builder.previewTabs.atsCheck'),
+                    disabled: !resumeId,
+                  },
+                  { id: 'writing', label: t('builder.previewTabs.writing') },
                 ]}
                 activeTab={activeTab}
                 onTabChange={(id) => setActiveTab(id as TabId)}
               />
             </div>
 
-            {/* Preview Content */}
-            <div className="flex-1 overflow-y-auto">
-              {/* Resume Preview */}
-              {activeTab === 'resume' && (
+            {/* Preview Content: the active tab's panel */}
+            <div
+              id={`builder-panel-${activeTab}`}
+              role="tabpanel"
+              aria-labelledby={`builder-tab-${activeTab}`}
+              className="flex-1 overflow-y-auto"
+            >
+              {/* Resume Preview (the Writing tab shows the resume it edits) */}
+              {(activeTab === 'resume' || activeTab === 'writing') && (
                 <PaginatedPreview
                   resumeData={localizedResumeDataForPreview}
                   settings={templateSettings}
@@ -1714,12 +2138,7 @@ const ResumeBuilderContent = () => {
                     />
                   </div>
                 ) : (
-                  <GeneratePrompt
-                    type="cover-letter"
-                    isGenerating={isGeneratingCoverLetter}
-                    onGenerate={handleGenerateCoverLetter}
-                    isTailoredResume={isTailoredResume}
-                  />
+                  nothingYet
                 ))}
 
               {/* Outreach Preview */}
@@ -1729,66 +2148,57 @@ const ResumeBuilderContent = () => {
                     <OutreachPreview content={outreachMessage} />
                   </div>
                 ) : (
-                  <GeneratePrompt
-                    type="outreach"
-                    isGenerating={isGeneratingOutreach}
-                    onGenerate={handleGenerateOutreach}
-                    isTailoredResume={isTailoredResume}
-                  />
+                  nothingYet
                 ))}
 
-              {/* Interview Prep Preview */}
-              {activeTab === 'interview-prep' && (
-                <InterviewPrepView
-                  interviewPrep={interviewPrep}
-                  isGenerating={isGeneratingInterviewPrep}
-                  error={interviewPrepError}
-                  onGenerate={handleGenerateInterviewPrep}
-                  isTailoredResume={isTailoredResume}
-                  canGenerate={canGenerateInterviewPrep}
-                  unavailableMessage={interviewPrepUnavailableMessage}
-                />
-              )}
+              {/* Interview Prep Output */}
+              {activeTab === 'interview-prep' &&
+                (interviewPrep ? (
+                  <InterviewPrepView
+                    interviewPrep={interviewPrep}
+                    isGenerating={isGeneratingInterviewPrep}
+                    error={interviewPrepError}
+                    onGenerate={handleGenerateInterviewPrep}
+                    isTailoredResume={isTailoredResume}
+                    canGenerate={canGenerateInterviewPrep}
+                    unavailableMessage={interviewPrepUnavailableMessage}
+                  />
+                ) : (
+                  nothingYet
+                ))}
 
               {/* JD Match Comparison */}
               {activeTab === 'jd-match' && jobDescription && (
-                <JDComparisonView jobDescription={jobDescription} resumeData={resumeData} />
+                <JDComparisonView
+                  jobDescription={jobDescription}
+                  resumeData={resumeData}
+                  jobKeywords={jobKeywords}
+                  company={jobCompany}
+                  forcedKeywords={jobForcedKeywords}
+                />
+              )}
+
+              {/* ATS Parse Check */}
+              {activeTab === 'ats-check' && (
+                <AtsCheckView
+                  resumeId={resumeId}
+                  settings={templateSettings}
+                  locale={uiLanguage}
+                  hasUnsavedChanges={hasUnsavedChanges}
+                />
               )}
             </div>
           </div>
         </div>
-
-        {/* Footer */}
-        <div className="p-4 bg-background flex justify-between items-center font-mono text-xs text-blue-700 border-t border-black no-print">
-          <span className="uppercase font-bold flex items-center gap-2">
-            <Image
-              src="/logo.svg"
-              alt="Resume Matcher"
-              width={20}
-              height={20}
-              className="w-5 h-5"
-            />
-            {t('builder.footer.moduleLabel')}
-          </span>
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 bg-green-700"></div>
-              <span className="uppercase">
-                {templateSettings.template === 'swiss-single' ||
-                templateSettings.template === 'modern' ||
-                templateSettings.template === 'latex' ||
-                templateSettings.template === 'clean'
-                  ? t('builder.footer.singleColumn')
-                  : t('builder.footer.twoColumn')}
-              </span>
-            </div>
-            <span className="text-steel-grey">|</span>
-            <span className="uppercase">
-              {templateSettings.pageSize === 'A4' ? 'A4' : t('builder.pageSize.usLetter')}
-            </span>
-          </div>
-        </div>
       </div>
+
+      {agentMode && (
+        <AgentPromptDialog
+          task={agentTask}
+          resumeId={resumeId ?? ''}
+          onClose={() => setAgentTask(null)}
+        />
+      )}
 
       {/* Regenerate Confirmation Dialog */}
       <ConfirmDialog
@@ -1810,6 +2220,7 @@ const ResumeBuilderContent = () => {
       <ConfirmDialog
         open={pendingDraftRestore !== null || pendingAttachmentDraftRestore !== null}
         onOpenChange={() => undefined}
+        dismissible={false}
         title={t('builder.draftRecovery.title')}
         description={t(
           resumeId ? 'builder.draftRecovery.description' : 'builder.draftRecovery.newDescription'
@@ -1888,18 +2299,18 @@ const ResumeBuilderContent = () => {
   );
 };
 
-const ResumeBuilderDocument = () => {
+const ResumeBuilderDocument = ({ agentMode }: ResumeBuilderProps) => {
   const searchParams = useSearchParams();
   // Query-only navigation can retain this page. Remount the editor at the
   // document boundary so every baseline, queue and draft belongs to one ID.
-  return <ResumeBuilderContent key={searchParams.get('id') ?? 'new'} />;
+  return <ResumeBuilderContent key={searchParams.get('id') ?? 'new'} agentMode={agentMode} />;
 };
 
-export const ResumeBuilder = () => {
+export const ResumeBuilder = ({ agentMode }: ResumeBuilderProps) => {
   const { t } = useTranslations();
   return (
     <Suspense fallback={<div>{t('common.loading')}</div>}>
-      <ResumeBuilderDocument />
+      <ResumeBuilderDocument agentMode={agentMode} />
     </Suspense>
   );
 };

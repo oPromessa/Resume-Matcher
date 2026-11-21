@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Callable
 
-from app.llm import complete_json
+from app.llm import (
+    complete_json,
+    get_llm_config,
+    get_model_name,
+    get_safe_max_tokens,
+)
 from app.prompts import (
     CRITICAL_TRUTHFULNESS_RULES,
     DEFAULT_IMPROVE_PROMPT_ID,
@@ -22,8 +27,16 @@ from app.prompts import (
 )
 from app.prompts.templates import IMPROVE_SCHEMA_EXAMPLE
 from app.schemas import ResumeData, ResumeDiffSummary, ResumeFieldDiff
-from app.schemas.models import ImproveDiffResult, ResumeChange
+from app.schemas.models import (
+    SKILL_ROW_BREAK,
+    ImproveDiffResult,
+    ResumeChange,
+    has_skill_row_layout,
+    skill_names,
+    skills_end_in_open_label,
+)
 from app.services.parser import has_meaningful_resume_content
+from app.services.text_match import keyword_in_text, normalize_skill_key
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +195,8 @@ _BLOCKED_FIELD_NAMES = frozenset(
     }
 )
 
-_METRIC_RE = re.compile(r"\d+%|\d+x|\$\d+")
+# Starting only where a digit run starts keeps a long unsuffixed run linear.
+_METRIC_RE = re.compile(r"(?<!\d)\d+[%x]|\$\d+")
 
 
 def _is_path_allowed(path: str) -> bool:
@@ -287,9 +301,11 @@ def _set_at_path(data: dict[str, Any], path: str, value: Any) -> bool:
 
 
 def _verify_original_matches(actual: Any, expected: str | list[str] | None) -> bool:
-    """Verify that the original text from the diff matches the actual value."""
-    if expected is None:
-        return True  # no original provided (e.g. append) — nothing to verify
+    """Verify that the original text from the diff matches the actual value.
+
+    A replace must quote what it replaces: without ``original`` there is
+    nothing to verify, so the change is rejected rather than applied blind.
+    """
     if not isinstance(expected, str):
         return False  # a non-str original on a text action is malformed — reject
     if not isinstance(actual, str):
@@ -305,12 +321,57 @@ def is_fixed_row_append(
     return change.action == "append" and section in fixed_row_sections
 
 
+_BULLET_LIST_PATH_RE = re.compile(
+    r"^(?:workExperience|personalProjects)\[\d+\]\.description$"
+)
+
+
+def _bullet_order(source_rows: list[Any], proposed: list[Any]) -> list[int] | None:
+    """Indices of ``source_rows`` in the order of ``proposed``, or None.
+
+    ``proposed`` must be an exact permutation of the source bullets (compared
+    case-insensitively); anything else is not a pure reorder.
+    """
+    if len(proposed) != len(source_rows) or not all(
+        isinstance(item, str) for item in proposed
+    ):
+        return None
+    remaining: dict[str, list[int]] = {}
+    for index, row in enumerate(source_rows):
+        if not isinstance(row, str):
+            return None
+        remaining.setdefault(row.strip().casefold(), []).append(index)
+    order: list[int] = []
+    for item in proposed:
+        bucket = remaining.get(item.strip().casefold())
+        if not bucket:
+            return None
+        order.append(bucket.pop(0))
+    return order
+
+
+def _apply_bullet_order(result: dict[str, Any], path: str, order: list[int]) -> bool:
+    entry_path = path.rsplit(".", 1)[0]
+    entry, resolved = _resolve_path(result, entry_path)
+    if not resolved or not isinstance(entry, dict):
+        return False
+    rows = entry.get("description")
+    if not isinstance(rows, list) or len(rows) != len(order):
+        return False
+    entry["description"] = [rows[i] for i in order]
+    styles = entry.get("descriptionStyles")
+    if isinstance(styles, list) and len(styles) == len(order):
+        entry["descriptionStyles"] = [styles[i] for i in order]
+    return True
+
+
 def apply_diffs(
     original: dict[str, Any],
     changes: list[ResumeChange],
     allowed_skill_targets: list[dict[str, Any] | str] | None = None,
     *,
     fixed_row_sections: tuple[str, ...] = (),
+    allow_bullet_reorder: bool = False,
 ) -> tuple[dict[str, Any], list[ResumeChange], list[ResumeChange]]:
     """Apply verified diffs to original resume.
 
@@ -328,6 +389,10 @@ def apply_diffs(
         allowed_skill_targets: Verified skill targets allowed for add_skill actions
         fixed_row_sections: Sections whose bullet set the harness already chose;
             appends to them are rejected so rewriting never adds bullets
+        allow_bullet_reorder: Whether a "reorder" of a work or project entry's
+            bullets is allowed (heavy rewrite). It names the original bullets in
+            their new order and is applied after every other change, so replaces
+            keep addressing the original indices.
 
     Returns:
         (result_dict, applied_changes, rejected_changes)
@@ -336,6 +401,7 @@ def apply_diffs(
     applied: list[ResumeChange] = []
     rejected: list[ResumeChange] = []
     allowed_skill_keys = _build_allowed_skill_target_keys(allowed_skill_targets)
+    bullet_orders: list[tuple[ResumeChange, list[int]]] = []
 
     for change in changes:
         path = change.path
@@ -402,9 +468,50 @@ def apply_diffs(
             actual_value.append(change.value)
             applied.append(change)
 
+        elif action == "reorder" and _BULLET_LIST_PATH_RE.match(path):
+            source_rows, _ = _resolve_path(original, path)
+            order = (
+                _bullet_order(source_rows, change.value)
+                if allow_bullet_reorder
+                and isinstance(source_rows, list)
+                and isinstance(change.value, list)
+                else None
+            )
+            if order is None or any(queued.path == path for queued, _ in bullet_orders):
+                logger.info("Diff rejected (bullet reorder): %s", path)
+                rejected.append(change)
+                continue
+            bullet_orders.append((change, order))
+
         elif action == "reorder":
             if not isinstance(actual_value, list) or not isinstance(change.value, list):
                 rejected.append(change)
+                continue
+            if path == "additional.technicalSkills" and has_skill_row_layout(
+                actual_value
+            ):
+                # The user laid the skills out in rows ("---" breaks or bare
+                # "Label:" lines); a relevance reorder would move skills between
+                # rows. Keep the order and only add verified new skills after it.
+                existing = skill_names(actual_value)
+                added: list[str] = []
+                for item in change.value:
+                    skill = item.strip() if isinstance(item, str) else ""
+                    if (
+                        skill
+                        and skill.casefold() not in existing
+                        and normalize_skill_key(skill) in allowed_skill_keys
+                    ):
+                        added.append(skill)
+                        existing.add(skill.casefold())
+                if not added:
+                    logger.info("Diff rejected (skills keep their rows): %s", path)
+                    rejected.append(change)
+                    continue
+                if skills_end_in_open_label(actual_value):
+                    actual_value.append(SKILL_ROW_BREAK)
+                actual_value.extend(added)
+                applied.append(change)
                 continue
             orig_set = sorted(s.casefold() for s in actual_value if isinstance(s, str))
             new_set = sorted(s.casefold() for s in change.value if isinstance(s, str))
@@ -454,7 +561,7 @@ def apply_diffs(
                         # else: a duplicate of an already-placed original — skip
                     elif is_skills and cf not in added_new:
                         skill = item.strip()
-                        if skill and _normalize_skill_key(skill) in allowed_skill_keys:
+                        if skill and normalize_skill_key(skill) in allowed_skill_keys:
                             reordered.append(
                                 skill
                             )  # verified new skill, requested position
@@ -489,24 +596,31 @@ def apply_diffs(
                 rejected.append(change)
                 continue
             new_skill = change.value.strip()
-            existing = {
-                item.casefold() for item in actual_value if isinstance(item, str)
-            }
-            if new_skill.casefold() in existing:
+            # Count skills inside "Label: a, b" lines too, so a grouped skill
+            # is not added a second time.
+            if new_skill.casefold() in skill_names(actual_value):
                 logger.info("Diff rejected (duplicate skill): %s", new_skill)
                 rejected.append(change)
                 continue
-            if _normalize_skill_key(new_skill) not in allowed_skill_keys:
+            if normalize_skill_key(new_skill) not in allowed_skill_keys:
                 logger.info(
                     "Diff rejected (skill not in verified targets): %s", new_skill
                 )
                 rejected.append(change)
                 continue
+            if skills_end_in_open_label(actual_value):
+                actual_value.append(SKILL_ROW_BREAK)
             actual_value.append(new_skill)
             applied.append(change)
 
         else:
             logger.info("Diff rejected (unknown action): %s", action)
+            rejected.append(change)
+
+    for change, order in bullet_orders:
+        if _apply_bullet_order(result, change.path, order):
+            applied.append(change)
+        else:
             rejected.append(change)
 
     return result, applied, rejected
@@ -673,10 +787,12 @@ async def generate_resume_diffs(
         original_resume=resume_input,
     )
 
+    config = get_llm_config()
+    model_name = get_model_name(config)
     result = await complete_json(
         prompt=prompt,
         system_prompt="You are an expert resume editor. Output only valid JSON with targeted changes.",
-        max_tokens=4096,
+        max_tokens=get_safe_max_tokens(model_name, config=config),
         schema_type="diff",
         response_validator=_validate_diff_result,
     )
@@ -769,11 +885,6 @@ def _prepare_keywords_for_prompt(job_keywords: dict[str, Any]) -> str:
     return "\n\n".join(sections) if sections else "No specific keywords extracted."
 
 
-def _normalize_skill_key(skill: str) -> str:
-    """Normalize a skill for case-insensitive comparison."""
-    return re.sub(r"\s+", " ", skill.strip()).casefold()
-
-
 def _extract_skill_index(items: Any) -> dict[str, str]:
     """Build a normalized skill index from a string list."""
     if not isinstance(items, list):
@@ -784,16 +895,8 @@ def _extract_skill_index(items: Any) -> dict[str, str]:
             continue
         skill = item.strip()
         if skill:
-            index.setdefault(_normalize_skill_key(skill), skill)
+            index.setdefault(normalize_skill_key(skill), skill)
     return index
-
-
-def _skill_mentioned_in_text(skill: str, text: str) -> bool:
-    """Return True when a skill phrase appears as a whole term in text."""
-    escaped = re.escape(skill.strip().lower())
-    if not escaped:
-        return False
-    return bool(re.search(rf"(?<!\w){escaped}(?!\w)", text.lower()))
 
 
 def _build_allowed_skill_target_keys(
@@ -809,7 +912,7 @@ def _build_allowed_skill_target_keys(
         else:
             continue
         if skill.strip():
-            keys.add(_normalize_skill_key(skill))
+            keys.add(normalize_skill_key(skill))
     return keys
 
 
@@ -828,17 +931,16 @@ def _extract_jd_skill_index(
                 continue
             skill = value.strip()
             if skill and (
-                job_description is None
-                or _skill_mentioned_in_text(skill, job_description)
+                job_description is None or keyword_in_text(skill, job_description)
             ):
-                index.setdefault(_normalize_skill_key(skill), skill)
+                index.setdefault(normalize_skill_key(skill), skill)
     return index
 
 
 def _skill_present_in_resume_text(skill: str, resume_data: dict[str, Any]) -> bool:
     """Return True when a skill phrase already appears in the resume text."""
     text = json.dumps(resume_data, ensure_ascii=False)
-    return _skill_mentioned_in_text(skill, text)
+    return keyword_in_text(skill, text)
 
 
 def verify_skill_target_plan(
@@ -876,7 +978,7 @@ def verify_skill_target_plan(
         else:
             continue
 
-        skill_key = _normalize_skill_key(skill)
+        skill_key = normalize_skill_key(skill)
         if not skill or skill_key in seen:
             continue
         seen.add(skill_key)

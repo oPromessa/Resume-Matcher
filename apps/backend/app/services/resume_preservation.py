@@ -9,6 +9,12 @@ from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Any
 
+from app.schemas.models import (
+    SKILL_ROW_BREAK,
+    has_skill_row_layout,
+    skills_end_in_open_label,
+)
+
 GROUNDING_REVIEW_CODE = "GROUNDING_REVIEW_REQUIRED"
 _GROUNDING_REVIEW_THRESHOLD = 0.45
 
@@ -19,11 +25,13 @@ _ENTRY_FIELDS: dict[str, tuple[str, ...]] = {
     "customItems": ("title", "subtitle"),
 }
 _PROTECTED_FIELDS: dict[str, tuple[str, ...]] = {
-    "workExperience": ("id", "title", "company", "location", "years"),
+    "workExperience": ("id", "title", "company", "location", "years", "condensed"),
     "education": ("id", "institution", "degree", "years"),
     "personalProjects": ("id", "name", "role", "years", "github", "website"),
     "customItems": ("id", "title", "subtitle", "location", "years"),
 }
+# Yes/no entry flags: a missing key reads as false, so legacy data compares equal.
+_FLAG_FIELDS = frozenset({"condensed"})
 _TOKEN_RE = re.compile(r"[\w+#./-]+", re.UNICODE)
 _NUMBER_RE = re.compile(
     r"(?<![\w.])(?P<currency>[$€£])?(?P<number>\d[\d,]*(?:\.\d+)?)"
@@ -462,6 +470,22 @@ def _merge_additional(source: Any, candidate: Any) -> dict[str, list[str]]:
                     preserved_candidate_items.append(item)
                     remaining_source_items[key] -= 1
             candidate_items = preserved_candidate_items
+        elif has_skill_row_layout(source_items):
+            # The user laid the skills out in rows ("---" breaks or bare "Label:"
+            # lines). Keep their order so an AI rewrite cannot move skills between
+            # rows; new skills go last, in a row of their own after a bare label.
+            remaining_source_items = Counter(_normalized(item) for item in source_items)
+            added_items: list[str] = []
+            for item in candidate_items:
+                key = _normalized(item)
+                if remaining_source_items[key] > 0:
+                    remaining_source_items[key] -= 1
+                else:
+                    added_items.append(item)
+            if added_items and skills_end_in_open_label(source_items):
+                added_items.insert(0, SKILL_ROW_BREAK)
+            result[field] = [*source_items, *added_items]
+            continue
         remaining_candidate_items = Counter(
             _normalized(item) for item in candidate_items
         )
@@ -575,6 +599,16 @@ def _entry_map(
     return result
 
 
+def _protected_field_changed(
+    field: str, source_entry: dict[str, Any], candidate_entry: dict[str, Any]
+) -> bool:
+    if field in _FLAG_FIELDS:
+        return bool(source_entry.get(field)) != bool(candidate_entry.get(field))
+    return field in source_entry and source_entry.get(field) != candidate_entry.get(
+        field
+    )
+
+
 def _entry_bucket_violation(
     source_entries: list[dict[str, Any]],
     candidate_entries: list[dict[str, Any]],
@@ -593,8 +627,7 @@ def _entry_bucket_violation(
         available.remove(source_index)
         source_entry = source_entries[source_index]
         if any(
-            field in source_entry
-            and source_entry.get(field) != candidate_entry.get(field)
+            _protected_field_changed(field, source_entry, candidate_entry)
             for field in _PROTECTED_FIELDS[section]
         ):
             return "identity"

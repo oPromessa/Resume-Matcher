@@ -13,20 +13,23 @@ from app.services.bullet_selector import (
     PageFitStatus,
     PageMeasureError,
     count_bullets,
-    fit_to_one_page,
+    fit_to_page_limit,
     select_bullets,
 )
-from app.services.page_fit import measure_page_count
+from app.services.page_fit import measure_page_count, page_limit
 
 logger = logging.getLogger(__name__)
 
 BULLET_SCORING_FALLBACK_WARNING = (
     "Bullet relevance scoring fell back to keyword matching"
 )
-PAGE_FIT_OVER_WARNING = "Resume still exceeds one page at one bullet per role"
+PAGE_FIT_OVER_WARNING = (
+    "Resume exceeds the page limit even at one bullet per role; "
+    "all selected bullets were kept"
+)
 PAGE_FIT_UNAVAILABLE_WARNING = "Page fit skipped: the resume could not be rendered"
 PAGE_FIT_FINAL_OVER_WARNING = (
-    "Tailored resume may run slightly over one page after rewriting"
+    "Tailored resume may run slightly over the page limit after rewriting"
 )
 # Operation budget held back from every page render for the stages that follow it.
 FINAL_CHECK_RESERVE_SECONDS = 10
@@ -48,8 +51,9 @@ async def run_bullet_selection(
     source_data: dict[str, Any],
     job_description: str,
     job_keywords: dict[str, Any],
-    max_per_entry: int,
+    max_per_entry: int | None,
     page_fit: PageFitSettings | None,
+    max_pages: int = 1,
 ) -> SelectionOutcome:
     scores, scoring = await score_bullets(source_data, job_description, job_keywords)
     selection = select_bullets(source_data, scores, max_per_entry)
@@ -60,6 +64,7 @@ async def run_bullet_selection(
     status: PageFitStatus = "skipped"
     trimmed = 0
     pages: int | None = None
+    limit = page_limit(page_fit, max_pages)
     if page_fit is not None:
         fit_deadline = _page_fit_deadline()
 
@@ -68,7 +73,9 @@ async def run_bullet_selection(
                 draft, page_fit, fit_deadline=fit_deadline
             )
 
-        fit = await fit_to_one_page(selection.data, selection.scores, measure)
+        fit = await fit_to_page_limit(
+            selection.data, selection.scores, measure, max_pages=limit
+        )
         data, status, trimmed, pages = fit.data, fit.status, fit.trimmed, fit.pages
         if status == "over":
             warnings.append(PAGE_FIT_OVER_WARNING)
@@ -76,6 +83,7 @@ async def run_bullet_selection(
             warnings.append(PAGE_FIT_UNAVAILABLE_WARNING)
     summary = BulletSelectionSummary(
         max_per_entry=max_per_entry,
+        max_pages=limit if page_fit is not None else None,
         bullets_before=selection.bullets_before,
         bullets_after=count_bullets(data),
         trimmed_for_fit=trimmed,

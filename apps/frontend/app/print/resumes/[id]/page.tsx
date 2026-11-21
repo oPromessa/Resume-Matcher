@@ -13,6 +13,7 @@ import { API_BASE } from '@/lib/api/client';
 import { translate } from '@/lib/i18n/server';
 import { resolveLocale } from '@/lib/i18n/locale';
 import { withLocalizedDefaultSections } from '@/lib/utils/section-helpers';
+import { runningHeaderCss } from '@/lib/print/running-header';
 
 type PageProps = {
   params: Promise<{ id: string }>;
@@ -114,8 +115,8 @@ async function fetchResumeData(id: string, draftToken?: string): Promise<ResumeD
  */
 function parseSpacingLevel(value: string | undefined, defaultValue: SpacingLevel): SpacingLevel {
   if (!value) return defaultValue;
-  const num = parseInt(value, 10);
-  if (isNaN(num) || num < 1 || num > 5) return defaultValue;
+  const num = Number.parseInt(value, 10);
+  if (Number.isNaN(num) || num < 1 || num > 5) return defaultValue;
   return num as SpacingLevel;
 }
 
@@ -124,8 +125,8 @@ function parseSpacingLevel(value: string | undefined, defaultValue: SpacingLevel
  */
 function parseMargin(value: string | undefined, defaultValue: number): number {
   if (!value) return defaultValue;
-  const num = parseInt(value, 10);
-  if (isNaN(num)) return defaultValue;
+  const num = Number.parseInt(value, 10);
+  if (Number.isNaN(num)) return defaultValue;
   return Math.max(5, Math.min(25, num));
 }
 
@@ -141,7 +142,10 @@ function parseTemplate(value: string | undefined): TemplateType {
     value === 'modern-two-column' ||
     value === 'latex' ||
     value === 'clean' ||
-    value === 'vivid'
+    value === 'vivid' ||
+    value === 'vivid-single' ||
+    value === 'modern-deedy' ||
+    value === 'deedy'
   ) {
     return value;
   }
@@ -166,13 +170,17 @@ export default async function PrintResumePage({ params, searchParams }: PageProp
   try {
     resumeData = await fetchResumeData(resolvedParams.id, draftToken);
   } catch (error) {
-    if (!draftToken) throw error;
-    // Page-fit drafts are short-lived. Render a marker the PDF renderer waits for
-    // so a missing or expired draft fails fast instead of timing out.
-    console.error('Failed to load page-fit draft:', {
+    // Render a marker the PDF renderer waits for, so a resume that cannot load
+    // (an expired page-fit draft, an unreachable backend) fails fast instead
+    // of timing out.
+    console.error(draftToken ? 'Failed to load page-fit draft:' : 'Failed to load resume:', {
       error: error instanceof Error ? error.message : 'Unknown error',
     });
-    return <div data-print-error="draft-unavailable">Draft unavailable</div>;
+    return draftToken ? (
+      <div data-print-error="draft-unavailable">Draft unavailable</div>
+    ) : (
+      <div data-print-error="resume-unavailable">Resume unavailable</div>
+    );
   }
   const locale = resolveLocale(resolvedSearchParams?.lang);
   const t = (key: string, params?: Record<string, string | number>) =>
@@ -194,6 +202,7 @@ export default async function PrintResumePage({ params, searchParams }: PageProp
     languages: t('resume.sections.languages'),
     awards: t('resume.sections.awards'),
     links: t('resume.sections.links'),
+    earlierExperience: t('resume.sections.earlierExperience'),
   };
   const fallbackLabels = {
     name: t('resume.defaults.name'),
@@ -265,6 +274,12 @@ export default async function PrintResumePage({ params, searchParams }: PageProp
     // `lang` also drives Chromium's own font fallback during PDF render, which
     // matters for the CJK faces (L-08).
     <div className="resume-print bg-white" lang={locale}>
+      {/* "Name · 2 / 3" on pages 2+; the CSS string is fully escaped. */}
+      <style
+        dangerouslySetInnerHTML={{
+          __html: runningHeaderCss(localizedResumeData.personalInfo?.name),
+        }}
+      />
       <Resume
         resumeData={localizedResumeData}
         template={settings.template}

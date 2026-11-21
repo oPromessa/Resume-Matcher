@@ -2,14 +2,18 @@
 
 import array
 import asyncio
+import copy
 import io
 import logging
 import re
 import tempfile
 import zipfile
 import zlib
+from collections.abc import Callable
+from contextlib import nullcontext
+from itertools import islice
 from pathlib import Path
-from typing import Any, BinaryIO, Sequence
+from typing import Any, BinaryIO, Sequence, TypeVar
 
 import anyio
 from markitdown import MarkItDown
@@ -17,7 +21,12 @@ from pdfminer.ascii85 import ascii85decode, asciihexdecode
 from pdfminer.ccitt import CCITTFaxDecoder
 from pdfminer.lzw import LZWDecoder
 from pdfminer.pdfdevice import PDFDevice
-from pdfminer.pdfdocument import PDFDocument
+from pdfminer.pdfdocument import (
+    PDFDocument,
+    PDFEncryptionError,
+    PDFObjectNotFound,
+    PDFPasswordIncorrect,
+)
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFParser
@@ -46,6 +55,8 @@ from app.schemas import ResumeData
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 DOCUMENT_IO_CHUNK_SIZE = 64 * 1024
 MAX_DOCX_MEMBERS = 1_024
 MAX_UNPACKED_DOCUMENT_BYTES = 16 * 1024 * 1024
@@ -53,9 +64,13 @@ MAX_EXTRACTED_TEXT_BYTES = 2 * 1024 * 1024
 # Decoder row buffers can allocate from dimensions before consuming input.
 MAX_PDF_SCANLINE_COLUMNS = 32_768
 MAX_PDF_SCANLINE_BYTES = 256 * 1024
+# PDFs with more pages are rejected by the container preflight, before any page
+# is interpreted past the budget or the document is converted. Every stream is
+# still decoded under the shared budget.
+MAX_PDF_PREFLIGHT_PAGES = 100
 DOCUMENT_CONVERSION_WORKERS = 2
 DOCUMENT_CONVERSION_TIMEOUT_SECONDS = 120.0
-_DOCUMENT_BACKGROUND_WORKERS: set[asyncio.Task[str]] = set()
+_DOCUMENT_BACKGROUND_WORKERS: set[asyncio.Task[Any]] = set()
 _DOCUMENT_CONVERSION_LIMITER = anyio.CapacityLimiter(DOCUMENT_CONVERSION_WORKERS)
 
 
@@ -63,8 +78,16 @@ class DocumentValidationError(ValueError):
     """Raised when uploaded bytes are not a structurally valid document."""
 
 
+class DocumentPasswordError(DocumentValidationError):
+    """Raised when a PDF needs a password (or uses unsupported encryption)."""
+
+
 class DocumentResourceLimitError(ValueError):
     """Raised when a valid document exceeds a bounded processing budget."""
+
+
+class DocumentPageLimitError(DocumentResourceLimitError):
+    """Raised when a PDF has more pages than ``MAX_PDF_PREFLIGHT_PAGES``."""
 
 
 _COMPOUND_FILE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
@@ -100,19 +123,30 @@ def _append_pdf_output(output: bytearray, chunk: bytes, limit: int) -> None:
 
 
 def _decode_flate_bounded(data: bytes, limit: int) -> bytes:
-    """Incrementally inflate a stream while enforcing its remaining budget."""
+    """Incrementally inflate a stream while enforcing its remaining budget.
+
+    Like pdfminer's own (non-strict) decoder, which does the real text
+    extraction, a truncated or corrupt stream yields the bytes decoded so far
+    instead of rejecting the whole document.
+    """
     decoder = zlib.decompressobj()
     output = bytearray()
-    for offset in range(0, len(data), DOCUMENT_IO_CHUNK_SIZE):
-        pending = data[offset : offset + DOCUMENT_IO_CHUNK_SIZE]
-        while pending:
-            max_output = min(DOCUMENT_IO_CHUNK_SIZE, limit - len(output) + 1)
-            chunk = decoder.decompress(pending, max_output)
-            _append_pdf_output(output, chunk, limit)
-            pending = decoder.unconsumed_tail
-    _append_pdf_output(output, decoder.flush(limit - len(output) + 1), limit)
-    if not decoder.eof:
-        raise ValueError("Truncated FlateDecode stream")
+    try:
+        for offset in range(0, len(data), DOCUMENT_IO_CHUNK_SIZE):
+            pending = data[offset : offset + DOCUMENT_IO_CHUNK_SIZE]
+            # Bytes after the end of the zlib data (often a newline counted in
+            # /Length) stay in unconsumed_tail forever once eof is reached, so
+            # stop there or this loop never ends.
+            while pending and not decoder.eof:
+                max_output = min(DOCUMENT_IO_CHUNK_SIZE, limit - len(output) + 1)
+                chunk = decoder.decompress(pending, max_output)
+                _append_pdf_output(output, chunk, limit)
+                pending = decoder.unconsumed_tail
+            if decoder.eof:
+                break
+        _append_pdf_output(output, decoder.flush(limit - len(output) + 1), limit)
+    except zlib.error:
+        logger.info("Corrupt FlateDecode stream; keeping %d decoded bytes", len(output))
     return bytes(output)
 
 
@@ -314,16 +348,28 @@ class _BoundedPDFParser(PDFParser):
                 )
 
 
-def _validate_pdf_container(path: Path) -> None:
-    """Require a readable PDF whose decoded streams fit a shared budget."""
+def _validate_pdf_container(source: Path | BinaryIO) -> None:
+    """Require a readable PDF whose decoded streams fit a shared budget.
+
+    ``source`` is a path or an open binary stream (left open for the caller).
+    Only the first ``MAX_PDF_PREFLIGHT_PAGES`` pages are interpreted; a PDF with
+    more pages is rejected before the rest of the document is scanned.
+    """
     try:
-        with path.open("rb") as stream:
+        with (
+            source.open("rb") if isinstance(source, Path) else nullcontext(source)
+        ) as stream:
             budget = _PDFDecodeBudget()
             document = PDFDocument(_BoundedPDFParser(stream, budget))
             manager = PDFResourceManager(caching=False)
             interpreter = PDFPageInterpreter(manager, PDFDevice(manager))
             has_pages = False
-            for page in PDFPage.create_pages(document):
+            pages = islice(PDFPage.create_pages(document), MAX_PDF_PREFLIGHT_PAGES + 1)
+            for index, page in enumerate(pages):
+                if index >= MAX_PDF_PREFLIGHT_PAGES:
+                    raise DocumentPageLimitError(
+                        f"PDF has more than {MAX_PDF_PREFLIGHT_PAGES} pages."
+                    )
                 has_pages = True
                 # Follow the real text consumer's references under the same
                 # bounded stream decoder. A forged /Image label on a content
@@ -337,7 +383,13 @@ def _validate_pdf_container(path: Path) -> None:
                     if object_id in seen:
                         continue
                     seen.add(object_id)
-                    value = document.getobj(object_id)
+                    try:
+                        value = document.getobj(object_id)
+                    except PDFObjectNotFound:
+                        # An xref entry for an object the file does not contain
+                        # (common after incremental saves). Text extraction never
+                        # reaches it, so it must not reject the document.
+                        continue
                     if isinstance(value, PDFStream):
                         # Text extraction never decodes image XObjects. Their
                         # optional codecs must not reject otherwise readable text.
@@ -345,16 +397,18 @@ def _validate_pdf_container(path: Path) -> None:
                             value.get_data()
     except DocumentResourceLimitError:
         raise
+    except (PDFPasswordIncorrect, PDFEncryptionError) as exc:
+        raise DocumentPasswordError("The PDF is password-protected.") from exc
     except Exception as exc:
         raise DocumentValidationError(
             "The uploaded file is not a valid PDF, DOC, or DOCX document."
         ) from exc
 
 
-def _validate_docx_container(path: Path) -> None:
+def _validate_docx_container(source: Path | BinaryIO) -> None:
     """Require a bounded, readable Office Open XML word-processing package."""
     try:
-        with zipfile.ZipFile(path) as archive:
+        with zipfile.ZipFile(source) as archive:
             members = archive.infolist()
             if len(members) > MAX_DOCX_MEMBERS:
                 raise DocumentResourceLimitError(
@@ -523,7 +577,9 @@ def restore_dates_from_markdown(
     for line_index, line in enumerate(lines):
         line_context = " ".join(line.casefold().split())
         for match in _MD_DATE_RE.finditer(line):
-            full_date = re.sub(r"\s*[-–—]\s*", " - ", match.group(0).strip())
+            full_date = " - ".join(
+                part.strip() for part in re.split(r"[-–—]", match.group(0).strip())
+            )
             key = date_key(full_date)
             if key:
                 occurrences.append((key, full_date, line_context, line_index))
@@ -632,6 +688,156 @@ def restore_dates_from_markdown(
         logger.info("Restored months in %d date fields from raw markdown", patched)
 
     return parsed_data
+
+
+# A source line counts as a skill list when it has at least this many short items
+# and at least _MIN_LINE_ANCHORS of them were parsed as skills.
+_MIN_SKILL_LINE_ITEMS = 3
+_MIN_LINE_ANCHORS = 2
+_MAX_SKILL_ITEM_WORDS = 5
+_MAX_SKILL_ITEM_CHARS = 40
+# A real skill line has far fewer items; longer lines are rejected without being
+# fully split, so a hostile line can't be expanded into huge lists.
+_MAX_SKILL_LINE_ITEMS = 200
+# No surrounding \s*: it backtracks quadratically on a long run of whitespace.
+# Chunks are stripped instead.
+_SKILL_SEPARATOR_RE = re.compile(r"[,|;•·]")
+_LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+●▪◦‣]|\d+[.)])\s+")
+_LINE_LABEL_RE = re.compile(r"^[^:,]{1,80}:\s*")
+# PDF text extraction renders a visual gap (e.g. after a bold label) as 2+ spaces.
+_EXTRACTION_GAP_RE = re.compile(r"\s{2,}")
+_FINAL_CONJUNCTION_RE = re.compile(r"^(?:and|or|&)\s+", re.IGNORECASE)
+# "Rust and Go" closing a list without an Oxford comma holds two skills; "&"
+# stays whole: "Drag & Drop", "R & D".
+_INLINE_CONJUNCTION_RE = re.compile(r"(?<!\s)\s+(?:and|or)\s+", re.IGNORECASE)
+_SKILL_HEADING_RE = re.compile(
+    r"^(?:(?:technical|core|key|other)\s+)?"
+    r"(?:skills?|technologies|tools|frameworks?|platforms?|tech(?:nology)?\s+stack|stack)$",
+    re.IGNORECASE,
+)
+# Function words that mark a phrase as prose ("Built services with Python").
+_PROSE_WORDS = frozenset(
+    {"with", "for", "to", "the", "of", "in", "on", "using", "by", "from", "at", "into"}
+)
+# Function words that also appear inside names ("Ruby on Rails", "Internet of Things").
+_NAME_CONNECTORS = frozenset({"on", "of", "the", "in", "for"})
+
+
+def _skill_line_items(line: str, anchors: set[str]) -> list[str]:
+    """Items of a skill-list line, or [] if the line isn't a list of short items.
+
+    ``anchors`` are the casefolded skills the parser found; a gap-separated
+    first segment is kept only when it is one of them (otherwise it is a label
+    such as "Stack").
+    """
+    text = _LIST_MARKER_RE.sub("", line).strip()
+    text = _LINE_LABEL_RE.sub("", text)  # "Tools: Python, Rust" -> "Python, Rust"
+
+    chunks = _SKILL_SEPARATOR_RE.split(text, maxsplit=_MAX_SKILL_LINE_ITEMS)
+    if len(chunks) > _MAX_SKILL_LINE_ITEMS:
+        return []
+    items: list[str] = []
+    for index, chunk in enumerate(chunks):
+        gap_pieces = _EXTRACTION_GAP_RE.split(
+            chunk.strip(), maxsplit=_MAX_SKILL_LINE_ITEMS
+        )
+        segments = [seg for seg in gap_pieces if seg]
+        if index == 0 and len(segments) > 1 and segments[0].casefold() not in anchors:
+            segments = segments[1:]  # "Stack  TypeScript": drop the label
+        items.extend(segments)
+        if len(items) > _MAX_SKILL_LINE_ITEMS:
+            return []
+    # Keep a leading dot (".NET"); drop trailing sentence punctuation.
+    items = [item.strip().rstrip(".").strip() for item in items]
+    items = [item for item in items if item]
+    if items and _SKILL_HEADING_RE.match(items[0]):
+        items = items[1:]  # "Technical Skills | Python | React"
+    # A conjunction opening an item mid-line, or left dangling at the end, means a
+    # sentence wrapped across lines ("..., and Redis, ..., and search and").
+    if any(_FINAL_CONJUNCTION_RE.match(item) for item in items[:-1]) or any(
+        item.split()[-1].casefold() in {"and", "or", "&"} for item in items
+    ):
+        return []
+    if items:
+        # "Python, Rust, and Go" and "Python, Rust and Go". The split is bounded;
+        # an over-long last item is rejected below anyway.
+        last = _FINAL_CONJUNCTION_RE.sub("", items.pop())
+        items.extend(_INLINE_CONJUNCTION_RE.split(last, maxsplit=_MAX_SKILL_ITEM_WORDS))
+
+    if len(items) < _MIN_SKILL_LINE_ITEMS:
+        return []
+    for item in items:
+        words = item.split()
+        # Prose and contact or location details are not skill lists.
+        if (
+            len(item) > _MAX_SKILL_ITEM_CHARS
+            or len(words) > _MAX_SKILL_ITEM_WORDS
+            or "@" in item
+            or "://" in item
+            or _is_prose(words)
+        ):
+            return []
+    return items
+
+
+def _is_prose(words: list[str]) -> bool:
+    """A phrase with a function word is prose unless it reads like a name.
+
+    "Built services with Python" is prose; "Ruby on Rails" is a skill because
+    every other word is capitalized (or starts with a digit or symbol).
+    """
+    function_words = {w.casefold() for w in words} & _PROSE_WORDS
+    if not function_words:
+        return False
+    if function_words - _NAME_CONNECTORS:
+        return True  # "with", "using", "by", ... join clauses, not names
+    return not all(
+        not word[0].isalpha() or word[0].isupper()
+        for word in words
+        if word.casefold() not in _PROSE_WORDS
+    )
+
+
+def restore_skills_from_markdown(
+    parsed_data: dict[str, Any],
+    markdown: str,
+) -> dict[str, Any]:
+    """Restore technical skills the LLM dropped from skill-list lines of the source.
+
+    The parse LLM tends to summarize long skill blocks, keeping a handful of
+    items. A source line is treated as a skill list when it is a list of at
+    least three short items and at least two of them were parsed into
+    ``additional.technicalSkills``; its missing items are appended in source
+    order. Only the originally parsed skills anchor a line, so a restored item
+    can't pull in an unrelated line, and a single match ("Developer, Java, Acme
+    Corp") isn't enough. Spoken-language lines, locations and prose are left
+    alone.
+    """
+    additional = parsed_data.get("additional")
+    if not isinstance(additional, dict):
+        return parsed_data
+    skills = additional.get("technicalSkills")
+    if not isinstance(skills, list) or not skills:
+        return parsed_data
+
+    anchors = {skill.casefold() for skill in skills if isinstance(skill, str)}
+    known = set(anchors)
+    restored: list[str] = []
+    for line in markdown.splitlines():
+        items = _skill_line_items(line, anchors)
+        if sum(item.casefold() in anchors for item in items) < _MIN_LINE_ANCHORS:
+            continue
+        for item in items:
+            if item.casefold() not in known:
+                known.add(item.casefold())
+                restored.append(item)
+
+    if not restored:
+        return parsed_data
+    result = copy.deepcopy(parsed_data)
+    result["additional"]["technicalSkills"] = [*skills, *restored]
+    logger.info("Restored %d skills dropped while parsing", len(restored))
+    return result
 
 
 _NON_CONTENT_RESUME_KEYS = frozenset(
@@ -771,6 +977,13 @@ async def parse_document(content: bytes, filename: str) -> str:
     Returns:
         Markdown text content
     """
+    return await run_bounded_document_job(_parse_document_sync, content, filename)
+
+
+async def run_bounded_document_job(
+    job: Callable[[bytes, str], T], content: bytes, filename: str
+) -> T:
+    """Run a sync document job in a worker thread under the shared limiter and deadline."""
     deadline = asyncio.get_running_loop().time() + DOCUMENT_CONVERSION_TIMEOUT_SECONDS
     borrower = object()
     # Queued requests still belong to their caller. Only an admitted conversion
@@ -780,10 +993,10 @@ async def parse_document(content: bytes, filename: str) -> str:
         timeout=DOCUMENT_CONVERSION_TIMEOUT_SECONDS,
     )
 
-    async def run_admitted_worker() -> str:
+    async def run_admitted_worker() -> T:
         try:
             return await anyio.to_thread.run_sync(
-                _parse_document_sync, content, filename, abandon_on_cancel=False
+                job, content, filename, abandon_on_cancel=False
             )
         finally:
             _DOCUMENT_CONVERSION_LIMITER.release_on_behalf_of(borrower)
@@ -799,7 +1012,7 @@ async def parse_document(content: bytes, filename: str) -> str:
         # the worker retains its limiter slot and owns its tempfile until done.
         _DOCUMENT_BACKGROUND_WORKERS.add(worker)
 
-        def consume_result(done: asyncio.Task[str]) -> None:
+        def consume_result(done: asyncio.Task[T]) -> None:
             _DOCUMENT_BACKGROUND_WORKERS.discard(done)
             if not done.cancelled():
                 try:
@@ -817,8 +1030,9 @@ async def parse_resume_to_json(markdown_text: str) -> dict[str, Any]:
     """Parse resume markdown to structured JSON using LLM.
 
     After LLM parsing, patches any year-only dates with month-inclusive
-    dates extracted from the raw markdown. This ensures months are never
-    lost regardless of LLM behavior.
+    dates extracted from the raw markdown, and restores skills the LLM
+    dropped from skill-list lines, so neither is lost regardless of LLM
+    behavior.
 
     Args:
         markdown_text: Resume content in markdown format
@@ -846,6 +1060,8 @@ async def parse_resume_to_json(markdown_text: str) -> dict[str, Any]:
 
     # Patch dates: restore months the LLM may have dropped
     result = restore_dates_from_markdown(result, markdown_text)
+    # Restore skills the LLM summarized away from long skill lists
+    result = restore_skills_from_markdown(result, markdown_text)
 
     # Validate against schema
     return _validate_parsed_resume(result)
